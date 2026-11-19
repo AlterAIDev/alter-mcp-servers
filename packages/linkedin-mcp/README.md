@@ -23,7 +23,7 @@ LinkedIn's official API lets a member app read the member's profile and publish 
 
 ## Set up
 
-You need an Alter account and the [`alter` CLI](https://docs.alterauth.com/reference/cli). Every step can also be done in the [Alter portal](https://portal.alterauth.com).
+You need an Alter account and the [`alter` CLI](https://docs.alterauth.com/reference/cli), version 0.10 or later (policy changes need it). Replace `<app-id>` and `<agent-id>` below with your app's and agent's ids. Every step can also be done in the [Alter portal](https://portal.alterauth.com).
 
 **1. An Alter app with an identity provider** (Auth0, Clerk, Okta, WorkOS or another OIDC provider), so you can delegate your LinkedIn account to an agent. See [identity providers](https://docs.alterauth.com/admin/identity-provider).
 
@@ -32,7 +32,7 @@ You need an Alter account and the [`alter` CLI](https://docs.alterauth.com/refer
 **3. An agent.** The key is printed once, in the `api_key` field:
 
 ```bash
-alter agents create --name linkedin-agent \
+alter agents create --app <app-id> --name linkedin-agent \
   --scopes '{"linkedin":["openid","profile","email","w_member_social"]}' \
   --output json | jq -r '.api_key'
 ```
@@ -47,10 +47,10 @@ alter connect create --provider linkedin --user-token "$USER_JWT" --agent linked
 
 ```bash
 echo '{"effect": "require_approval", "when": {"match": {"families": ["send", "write"]}}, "approval": {"channels": ["email"], "expires_in_seconds": 86400}}' | \
-  alter policy rules create --agent <agent-id> --type require_approval --body - --name "Approve every post"
+  alter policy rules create --app <app-id> --agent <agent-id> --type require_approval --body - --name "Approve every post"
 
 echo '{"when": {"family": ["delete"]}, "effect": "deny"}' | \
-  alter policy rules create --agent <agent-id> --body - --name "No deletes"
+  alter policy rules create --app <app-id> --agent <agent-id> --body - --name "No deletes"
 ```
 
 **6. Your MCP client.**
