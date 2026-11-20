@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { buildRawMessage, signatureText } from "../src/gmail.js";
+import { buildRawMessage, formatAddress, signatureText } from "../src/gmail.js";
 
 const decode = (raw: string) => Buffer.from(raw, "base64url").toString("utf8");
 
@@ -27,4 +27,11 @@ test("a non-ASCII attachment name is encoded per RFC 2231, and line breaks are s
     }),
   );
   assert.match(raw, /Content-Type: application\/pdf; name\*=UTF-8''r%C3%A9sum%C3%A9\.pdf\r\nContent-Disposition: attachment; filename\*=UTF-8''r%C3%A9sum%C3%A9\.pdf\r\n/);
+});
+
+test("sender display names are written plain, quoted or encoded as needed", () => {
+  assert.equal(formatAddress({ email: "a@example.com" }), "a@example.com");
+  assert.equal(formatAddress({ email: "a@example.com", name: "Sam Rivera" }), "Sam Rivera <a@example.com>");
+  assert.equal(formatAddress({ email: "a@example.com", name: 'Sam "S" Rivera, CEO' }), '"Sam \\"S\\" Rivera, CEO" <a@example.com>');
+  assert.equal(formatAddress({ email: "a@example.com", name: "Zoë\r\nBcc: x" }), "=?UTF-8?B?Wm/DqyBCY2M6IHg=?= <a@example.com>");
 });
