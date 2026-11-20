@@ -263,11 +263,12 @@ test("the primary address's signature is added below the body, in text and HTML"
   assert.match(raw, /\r\nContent-Type: multipart\/alternative; boundary="alter_[0-9a-f]+"\r\n/);
   const [text, html] = mimeParts(raw);
   assert.match(text?.head ?? "", /text\/plain/);
-  assert.equal(text?.bytes.toString("utf8"), "Line one\r\nLine <two>\r\n\r\n-- \r\nSrikar Dandamuraju\r\nAlter <https://alterauth.com> & friends");
+  assert.equal(text?.bytes.toString("utf8"), "Line one\r\nLine <two>\r\nSrikar Dandamuraju\r\nAlter <https://alterauth.com> & friends");
   assert.match(html?.head ?? "", /text\/html/);
   const htmlText = html?.bytes.toString("utf8") ?? "";
   assert.match(htmlText, /Line one<br>Line &lt;two&gt;/);
-  assert.ok(htmlText.includes(`class="gmail_signature">${SIGNATURE}</div>`));
+  assert.ok(htmlText.includes(`Line one<br>Line &lt;two&gt;</div><div dir="ltr" class="gmail_signature">${SIGNATURE}</div>`));
+  assert.ok(!htmlText.includes("-- ") && !htmlText.includes("gmail_signature_prefix"));
   assert.ok(!htmlText.includes("alias"));
 });
 

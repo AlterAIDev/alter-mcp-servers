@@ -97,6 +97,56 @@ export function signatureText(html: string): string {
 const escapeHtml = (text: string) =>
   text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
+/**
+ * The HTML version's font. Without one, clients pick their own fallback
+ * (Outlook uses Times New Roman); Arial is what Gmail's own editor sends.
+ */
+export const BODY_STYLE = "font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5";
+const BULLET = /^\s*[-*\u2022]\s+(.*)$/;
+
+/**
+ * A plain-text body as HTML: lines kept, and runs of bullet lines ("- ", "* "
+ * or "\u2022 ", blank lines between them allowed) made into a list with
+ * space between the items, so each item wraps under its own text.
+ */
+export function bodyHtml(body: string): string {
+  const lines = body.replace(/\r\n?/g, "\n").split("\n");
+  const out: string[] = [];
+  let text: string[] = [];
+  let items: string[] = [];
+  const flushText = () => {
+    if (text.length > 0) out.push(text.map(escapeHtml).join("<br>"));
+    text = [];
+  };
+  const flushList = () => {
+    if (items.length > 0) {
+      out.push(`<ul style="margin:8px 0 12px;padding-left:24px">${items.map((item) => `<li style="margin:0 0 8px">${escapeHtml(item)}</li>`).join("")}</ul>`);
+    }
+    items = [];
+  };
+  for (const [index, line] of lines.entries()) {
+    const bullet = line.match(BULLET);
+    if (bullet) {
+      while (text.length > 0 && text[text.length - 1]?.trim() === "") text.pop();
+      flushText();
+      items.push(bullet[1] ?? "");
+      continue;
+    }
+    if (line.trim() === "" && items.length > 0) {
+      const next = lines.slice(index + 1).find((rest) => rest.trim() !== "");
+      if (next === undefined || BULLET.test(next)) continue;
+      flushList();
+      continue;
+    }
+    flushList();
+    if (line.trim() === "" && text.length === 0 && out.length > 0) continue;
+    text.push(line);
+  }
+  flushList();
+  flushText();
+  return out.join("");
+}
+
 const base64Lines = (data: Uint8Array | string) =>
   Buffer.from(data as Uint8Array).toString("base64").replace(/.{1,76}/g, "$&\r\n");
 
@@ -148,10 +198,11 @@ export function buildRawMessage(message: OutgoingMessage): string {
   let content: { header: string; body: string };
   if (signatureHtml) {
     const signature = signatureText(signatureHtml);
-    const text = crlf(`${message.body}${signature ? `\n\n-- \n${signature}` : ""}`);
+    // Directly under the last line, with no "-- " separator, as Gmail places it.
+    const text = crlf(`${message.body}${signature ? `\n${signature}` : ""}`);
     const html =
-      `<div dir="ltr">${escapeHtml(message.body).replace(/\r?\n/g, "<br>")}</div>` +
-      `<br><span class="gmail_signature_prefix">-- </span><br><div dir="ltr" class="gmail_signature">${signatureHtml}</div>`;
+      `<div dir="ltr" style="${BODY_STYLE}"><div>${bodyHtml(message.body)}</div>` +
+      `<div dir="ltr" class="gmail_signature">${signatureHtml}</div></div>`;
     content = multipart("alternative", [textPart("text/plain", text), textPart("text/html", html)]);
   } else {
     content = { header: 'text/plain; charset="UTF-8"', body: base64Lines(Buffer.from(crlf(message.body), "utf8")) };
