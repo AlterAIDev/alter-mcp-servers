@@ -2,16 +2,24 @@
 
 Open-source MCP servers for AI agents where **the server never holds the provider token** and risky actions **wait for a person's approval**. Each server holds only an [Alter](https://alterauth.com) agent key. Alter stores the provider credential, adds it to each request, enforces the policies set on the agent, holds what needs approval, and records every call.
 
-| Server | Package | What it does |
-|---|---|---|
-| [Gmail](packages/gmail-mcp) | `@alter-ai/gmail-mcp` | Search, read, draft and send email; sends held for approval |
-| [LinkedIn](packages/linkedin-mcp) | `@alter-ai/linkedin-mcp` | Post, comment and react through LinkedIn's official API only; posts held for approval |
-| [X](packages/x-mcp) | `@alter-ai/x-mcp` | Search, read mentions, post, like and repost through X's official API only; posts held for approval |
-| [Notion](packages/notion-mcp) | `@alter-ai/notion-mcp` | Search, read pages as Markdown, query databases, create and add to pages, comment; deletes blocked |
+## Servers
 
-Run each server locally over stdio (`npx`), or host it as a multi-user Cloudflare Worker: everyone in your organization signs in through your Alter app's identity provider and works with their own account, under your Alter policies (see each package's "Host on Cloudflare").
+| Server | Package | Tools | Held for approval under the recommended policy |
+|---|---|---|---|
+| [Gmail](packages/gmail-mcp) | `@alter-ai/gmail-mcp` | `search_emails`, `read_email`, `create_draft`, `send_email`, `check_approval` | Sends |
+| [LinkedIn](packages/linkedin-mcp) | `@alter-ai/linkedin-mcp` | `get_profile`, `create_post`, `comment_on_post`, `react_to_post`, `check_approval` | Posts, comments and reactions |
+| [X (Twitter)](packages/x-mcp) | `@alter-ai/x-mcp` | `get_profile`, `search_posts`, `get_mentions`, `create_post`, `like_post`, `repost`, `check_approval` | Posts, likes and reposts |
+| [Notion](packages/notion-mcp) | `@alter-ai/notion-mcp` | `search`, `read_page`, `query_database`, `create_page`, `append_to_page`, `add_comment`, `check_approval` | Optional: new pages and comments |
 
-[`slack-approvals`](packages/slack-approvals) is a companion Cloudflare Worker: it posts each held request to a Slack channel, showing exactly what Alter will send, with Approve and Deny buttons.
+Every server uses only the provider's official API, and the recommended policy blocks deletes on all of them. Each package README lists its tools in detail, with the setup and the policies.
+
+Run a server locally over stdio (`npx`), or host it as a multi-user Cloudflare Worker: everyone in your organization signs in through your Alter app's identity provider and works with their own account, under your Alter policies (see each package's "Host on Cloudflare"). Until the first npm release, build from source (`pnpm install && pnpm build`).
+
+## Companion
+
+| Package | What it does |
+|---|---|
+| [Slack approvals](packages/slack-approvals) | A Cloudflare Worker that posts each request Alter holds for approval to a Slack channel, showing exactly what will be sent, with Approve and Deny buttons. Works with every server above. |
 
 ## Why build an MCP server this way
 
