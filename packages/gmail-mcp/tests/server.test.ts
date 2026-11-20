@@ -258,7 +258,7 @@ test("the primary address's signature is added below the body, in text and HTML"
   );
   const client = await connect(caller);
   const result = await client.callTool({ name: "send_email", arguments: { to: ["dana@example.com"], subject: "Hi", body: "Line one\nLine <two>" } });
-  assert.match(textOf(result), /your Gmail signature added/);
+  assert.match(textOf(result), /the Gmail signature of me@example\.com added/);
   const raw = decodeRaw((calls[1]?.json as { raw: string }).raw);
   assert.match(raw, /\r\nContent-Type: multipart\/alternative; boundary="alter_[0-9a-f]+"\r\n/);
   const [text, html] = mimeParts(raw);
@@ -340,4 +340,48 @@ test("a file path is refused on a hosted server, and read from disk when the ser
   assert.match(textOf(created), /1 attachment\(s\): deck\.pdf/);
   const raw = decodeRaw((local.calls[1]?.json as { message: { raw: string } }).message.raw);
   assert.equal(mimeParts(raw)[1]?.bytes.toString("utf8"), "%PDF-1.7 tiny");
+});
+
+// Sending address.
+
+const SEND_AS = {
+  sendAs: [
+    { sendAsEmail: "me@example.com", isPrimary: true, signature: "<div>Primary sig</div>" },
+    { sendAsEmail: "sales@example.com", displayName: "Sam at Example, Inc.", verificationStatus: "accepted", signature: "<div>Sales sig</div>" },
+    { sendAsEmail: "pending@example.com", verificationStatus: "pending", signature: "" },
+  ],
+};
+
+test("from sends as a verified alias, with its display name and its own signature", async () => {
+  const { caller, calls } = fakeCaller((args) => (args.method === "GET" ? json(200, SEND_AS) : json(200, { id: "s1" })));
+  const client = await connect(caller);
+  const result = await client.callTool({ name: "send_email", arguments: { from: "Sales@Example.com", to: ["dana@example.com"], subject: "Hi", body: "x" } });
+  assert.match(textOf(result), /With from sales@example\.com; the Gmail signature of sales@example\.com added\./);
+  const raw = decodeRaw((calls[1]?.json as { raw: string }).raw);
+  assert.match(raw, /^From: "Sam at Example, Inc\." <sales@example\.com>\r\nTo: dana@example\.com\r\n/);
+  const html = mimeParts(raw)[1]?.bytes.toString("utf8") ?? "";
+  assert.match(html, /Sales sig/);
+  assert.doesNotMatch(html, /Primary sig/);
+});
+
+test("an address the account cannot send from is refused, naming the ones it can", async () => {
+  const { caller, calls } = fakeCaller((args) => (args.method === "GET" ? json(200, SEND_AS) : json(200, { id: "s1" })));
+  const client = await connect(caller);
+  for (const from of ["pending@example.com", "someone@else.example"]) {
+    const result = await client.callTool({ name: "send_email", arguments: { from, to: ["dana@example.com"], subject: "Hi", body: "x" } });
+    assert.equal((result as { isError?: boolean }).isError, true);
+    assert.match(textOf(result), new RegExp(`${from.replace(/\./g, "\\.")} is not an address this Gmail account can send from.*Available: me@example\\.com, sales@example\\.com\\.`, "s"));
+  }
+  assert.ok(calls.every((call) => call.method === "GET"));
+});
+
+test("from is checked even without a signature, and the send-as list is read once", async () => {
+  const { caller, calls } = fakeCaller((args) => (args.method === "GET" ? json(200, SEND_AS) : json(200, { id: "d1" })));
+  const client = await connect(caller);
+  await client.callTool({ name: "create_draft", arguments: { from: "sales@example.com", to: ["a@example.com"], subject: "Hi", body: "x", include_signature: false } });
+  await client.callTool({ name: "create_draft", arguments: { from: "sales@example.com", to: ["a@example.com"], subject: "Hi", body: "y" } });
+  assert.equal(calls.filter((call) => call.method === "GET").length, 1);
+  const first = decodeRaw((calls[1]?.json as { message: { raw: string } }).message.raw);
+  assert.match(first, /^From: "Sam at Example, Inc\." <sales@example\.com>\r\n/);
+  assert.match(first, /Content-Type: text\/plain/);
 });

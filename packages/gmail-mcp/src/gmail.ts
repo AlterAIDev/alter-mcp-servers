@@ -19,7 +19,23 @@ export interface Attachment {
   data: Uint8Array;
 }
 
+export interface Sender {
+  email: string;
+  name?: string;
+}
+
+/** An address for a header: the display name plain, quoted, or RFC 2047-encoded as RFC 5322 requires. */
+export function formatAddress(sender: Sender): string {
+  const name = sender.name?.replace(/[\r\n]+/g, " ").trim();
+  if (!name) return sender.email;
+  if (!/^[\x20-\x7e]*$/.test(name)) return `${encodeHeaderText(name)} <${sender.email}>`;
+  if (/^[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~ ]+$/.test(name)) return `${name} <${sender.email}>`;
+  return `"${name.replace(/["\\]/g, "\\$&")}" <${sender.email}>`;
+}
+
 export interface OutgoingMessage {
+  /** A send-as address of the account; Gmail uses the primary address when this is absent. */
+  from?: Sender;
   to: string[];
   cc?: string[];
   bcc?: string[];
@@ -112,7 +128,8 @@ function multipart(subtype: string, parts: string[]): { header: string; body: st
 
 /** The base64url `raw` value Gmail's drafts and send endpoints take. */
 export function buildRawMessage(message: OutgoingMessage): string {
-  const headers = [`To: ${message.to.join(", ")}`];
+  const headers = message.from ? [`From: ${formatAddress(message.from)}`] : [];
+  headers.push(`To: ${message.to.join(", ")}`);
   if (message.cc?.length) headers.push(`Cc: ${message.cc.join(", ")}`);
   if (message.bcc?.length) headers.push(`Bcc: ${message.bcc.join(", ")}`);
   headers.push(`Subject: ${encodeHeaderText(message.subject)}`);
