@@ -30,6 +30,44 @@ AI client  ──MCP──▶  @alter-ai/gmail-mcp  ──agent key──▶  Al
 
 Each package README covers its setup: an Alter app, the provider, an agent, connecting your account, the recommended policies, and your MCP client's config.
 
+## How sign-in works on a hosted server
+
+A hosted server uses the MCP standard's own authorization flow ([OAuth 2.1, as the MCP specification defines it](https://modelcontextprotocol.io/specification/draft/basic/authorization)). It is not tied to any one client: Claude (web, desktop and Claude Code) and other MCP clients that support remote servers with OAuth sign in the same way. Clients register themselves, through Dynamic Client Registration or a Client ID Metadata Document, so there is nothing to set up per client.
+
+The server is the sign-in service the client talks to, but it does not run the login. It hands that to Alter, which uses the identity provider configured on your Alter app (Clerk, Auth0, Okta, WorkOS or any OIDC provider).
+
+```
+MCP client ──opens in your browser──▶ MCP server: consent page
+                                        "Allow <client> to use <server> as you?"
+                                              │ Allow and sign in
+                                              ▼
+                                      Alter sign-in ──▶ your identity provider's login page
+                                              │
+                                      MCP server: checks ALLOWED_USERS, finds YOUR own
+                                      connection through Alter (or offers to connect one)
+                                              │
+MCP client ◀──one-time code─────────── your browser returns to the client
+MCP client ──code──▶ MCP server ──▶ an access token for this server, bound to that connection
+```
+
+**Who sees what**
+
+| | The MCP client (Claude or another) | The MCP server | Alter | Your identity provider |
+|---|---|---|---|---|
+| The consent and sign-in pages | No: they go to your browser | Serves them | Runs the sign-in | Shows the login |
+| Your password | No | No | No | Yes |
+| Your identity-provider token | No | Briefly, to find your connection; kept encrypted only until sign-in finishes | Verifies it | Issues it |
+| An access token for this server | Yes, and it works nowhere else | Issues it; stores only a hash | No | No |
+| Your Gmail or LinkedIn credential | No | No | Holds it and adds it to each request | No |
+
+The AI model never takes part in sign-in. It sees only the tools and what they return.
+
+**Where the one-time code goes.** A web client receives it at its own callback address; the consent page shows that host, for example `claude.ai`. A local client such as Claude Code receives it on your computer at a `localhost` address, and the consent page warns that access is going to an app on this computer, so continue only if you just started connecting from it.
+
+**After sign-in.** The client sends its access token with every tool call. The server checks it, acts through the one connection the token is bound to, and Alter applies your policies and records the call. Access tokens last an hour and the client refreshes them; you sign in again after 30 days, or after you reconnect your account in Alter.
+
+**One caution.** Alter's sign-in is link-based: whoever started a sign-in gets its result. Start sign-ins only from your MCP client, and never finish a sign-in link someone sends you.
+
 ## Development
 
 ```bash
