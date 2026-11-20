@@ -198,10 +198,11 @@ export function buildRawMessage(message: OutgoingMessage): string {
   let content: { header: string; body: string };
   if (signatureHtml) {
     const signature = signatureText(signatureHtml);
-    const text = crlf(`${message.body}${signature ? `\n\n-- \n${signature}` : ""}`);
+    // Directly under the last line, with no "-- " separator, as Gmail places it.
+    const text = crlf(`${message.body}${signature ? `\n${signature}` : ""}`);
     const html =
       `<div dir="ltr" style="${BODY_STYLE}"><div>${bodyHtml(message.body)}</div>` +
-      `<br><span class="gmail_signature_prefix">-- </span><br><div dir="ltr" class="gmail_signature">${signatureHtml}</div></div>`;
+      `<div dir="ltr" class="gmail_signature">${signatureHtml}</div></div>`;
     content = multipart("alternative", [textPart("text/plain", text), textPart("text/html", html)]);
   } else {
     content = { header: 'text/plain; charset="UTF-8"', body: base64Lines(Buffer.from(crlf(message.body), "utf8")) };
