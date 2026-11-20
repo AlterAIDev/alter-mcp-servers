@@ -50,7 +50,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
 }
 
 export interface ProxyArgs {
-  method: "GET" | "POST";
+  method: "GET" | "POST" | "PATCH";
   url: string;
   /** `{name}` placeholders in `url`, URL-encoded by the SDK. */
   pathParams?: Record<string, string>;

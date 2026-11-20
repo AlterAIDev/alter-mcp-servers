@@ -6,6 +6,8 @@ Open-source MCP servers for AI agents where **the server never holds the provide
 |---|---|---|
 | [Gmail](packages/gmail-mcp) | `@alter-ai/gmail-mcp` | Search, read, draft and send email; sends held for approval |
 | [LinkedIn](packages/linkedin-mcp) | `@alter-ai/linkedin-mcp` | Post, comment and react through LinkedIn's official API only; posts held for approval |
+| [X](packages/x-mcp) | `@alter-ai/x-mcp` | Search, read mentions, post, like and repost through X's official API only; posts held for approval |
+| [Notion](packages/notion-mcp) | `@alter-ai/notion-mcp` | Search, read pages as Markdown, query databases, create and add to pages, comment; deletes blocked |
 
 Run each server locally over stdio (`npx`), or host it as a multi-user Cloudflare Worker: everyone in your organization signs in through your Alter app's identity provider and works with their own account, under your Alter policies (see each package's "Host on Cloudflare").
 
