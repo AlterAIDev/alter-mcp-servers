@@ -107,8 +107,6 @@ What happens when someone connects a client:
 3. The Worker checks they are on `ALLOWED_USERS`, then asks Alter, with their identity-provider token, for their own Gmail connection delegated to this server's agent. If they have none yet, the page offers **Connect Gmail**: they connect it once through Alter Connect, delegated to the agent.
 4. The client gets a token for this server bound to that one connection. Every tool call uses it, so nobody can reach another person's Gmail. Tokens are stored hashed in Workers KV.
 
-This is the MCP standard's authorization flow, so it works the same in any MCP client that supports remote servers, not only Claude. [How sign-in works](https://github.com/AlterAIDev/alter-mcp-servers#how-sign-in-works-on-a-hosted-server) shows each step and what the client, the server, Alter and your identity provider each see: the client never sees your password, your identity-provider token or the provider credential.
-
 One agent serves everyone: its rules (for example "approve every send") apply to all of them, and each person's own rules in Alter apply on top.
 
 **1. An Alter app key for sign-in and connecting** (separate from the agent key). The key is printed once, in the `plain_key` field:
@@ -131,9 +129,8 @@ npx wrangler secret put ALLOWED_USERS
 
 **3. Connect a client** to `https://alter-gmail-mcp.<your-subdomain>.workers.dev/mcp` and sign in when asked:
 
-- claude.ai and Claude Desktop: **Settings**, **Connectors**, **Add custom connector**.
+- claude.ai: **Settings**, **Connectors**, **Add custom connector**.
 - Claude Code: `claude mcp add --transport http gmail https://alter-gmail-mcp.<your-subdomain>.workers.dev/mcp`, then `/mcp` to sign in.
-- Any other MCP client that supports remote servers with OAuth: add the URL as a remote (HTTP) server.
 
 If someone reconnects their Gmail in Alter later, their client's next call is refused until they sign in again, which picks up the new connection.
 
