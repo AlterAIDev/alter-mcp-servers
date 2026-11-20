@@ -1,0 +1,16 @@
+{
+  // Hosted, multi-user X MCP server. Secrets (never commit values):
+  //   npx wrangler secret put ALTER_AGENT_API_KEY   # the agent's key
+  //   npx wrangler secret put ALTER_SIGNIN_KEY      # Alter app key: idp_users:read/write, connect:initiate, grants:write
+  //   npx wrangler secret put ALLOWED_USERS         # user ids, emails, @domain, or *
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "alter-x-mcp",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-11-12",
+  // global_fetch_strictly_public: the OAuth library fetches client metadata documents by URL.
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "workers_dev": true,
+  // Grants and tokens issued to MCP clients (stored hashed) and pending sign-ins.
+  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
+  "observability": { "enabled": true }
+}

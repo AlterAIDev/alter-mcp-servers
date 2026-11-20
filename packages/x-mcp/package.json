@@ -1,0 +1,64 @@
+{
+  "name": "@alter-ai/x-mcp",
+  "version": "0.1.0",
+  "description": "X (Twitter) MCP server on X's official API only: search, mentions, posting, likes and reposts, with posts held for human approval and every call audited, backed by Alter.",
+  "license": "MIT",
+  "author": "Alter AI <oss@alterauth.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AlterAIDev/alter-mcp-servers.git",
+    "directory": "packages/x-mcp"
+  },
+  "homepage": "https://github.com/AlterAIDev/alter-mcp-servers/tree/main/packages/x-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/AlterAIDev/alter-mcp-servers/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "alter-x-mcp": "./dist/index.js"
+  },
+  "main": "./dist/server.js",
+  "types": "./dist/server.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/tests/*.test.js",
+    "clean": "rm -rf dist dist-test",
+    "prepublishOnly": "pnpm run clean && pnpm run typecheck && pnpm run test && pnpm run build"
+  },
+  "dependencies": {
+    "@alter-ai/alter-sdk": "^0.34.1",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^4.6.6"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "x",
+    "twitter",
+    "x-mcp",
+    "twitter-mcp",
+    "ai-agents",
+    "human-in-the-loop",
+    "alter"
+  ],
+  "devDependencies": {
+    "@cloudflare/workers-oauth-provider": "1.2.4",
+    "wrangler": "4.162.0"
+  }
+}
