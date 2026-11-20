@@ -8,9 +8,18 @@ import {
   describeError,
   describePending,
 } from "./alter.js";
+import { type Media, MediaError, type MediaOptions, formatBytes, openMedia, reasonWithMedia } from "./media.js";
 import { VERSION } from "./version.js";
 import {
+  MAX_IMAGES,
   MAX_POST_CHARS,
+  MAX_VIDEO_BYTES,
+  PROCESSING_TIMEOUT_MS,
+  type ProcessingInfo,
+  UPLOAD_SEGMENT_BYTES,
+  maxBytesFor,
+  mediaCategory,
+  multipartBody,
   MAX_QUERY_CHARS,
   POST_ID,
   STANDARD_POST_CHARS,
@@ -62,10 +71,16 @@ const reason = z.string().max(500).optional().describe("Why this is being done. 
 
 export interface ServerOptions {
   log?: (message: string, error: unknown) => void;
+  /** Where media may come from. Defaults to public https URLs only. */
+  media?: MediaOptions;
+  /** Waits between processing checks; replaced in tests. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export function createXServer(caller: AlterCaller, options: ServerOptions = {}): McpServer {
   const log = options.log ?? ((message, error) => console.error(`[${SERVER_NAME}] ${message}`, error));
+  const mediaOptions: MediaOptions = options.media ?? { allowFiles: false };
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const server = new McpServer({ name: SERVER_NAME, version: VERSION });
 
   const run = async (tool: string, action: () => Promise<ToolResult>): Promise<ToolResult> => {
@@ -73,7 +88,7 @@ export function createXServer(caller: AlterCaller, options: ServerOptions = {}):
       return await action();
     } catch (error) {
       if (error instanceof Held) return ok(describePending(error.outcome, tool));
-      if (error instanceof ProviderFailure) return fail(error.message);
+      if (error instanceof ProviderFailure || error instanceof MediaError) return fail(error.message);
       log(`${tool} failed`, error);
       return fail(describeError(error, PROVIDER));
     }
@@ -183,26 +198,141 @@ export function createXServer(caller: AlterCaller, options: ServerOptions = {}):
       }),
   );
 
+  /** An upload step's response; a hold here means the policy holds uploads, which it should not. */
+  const uploadStep = (outcome: ProxyOutcome, what: string) => {
+    if (outcome.kind === "pending") {
+      throw new ProviderFailure(
+        `Alter held a media upload for approval (approval ${outcome.approvalId}). Uploads are not visible until the post is published, so hold the post instead: see the README's recommended policy.`,
+      );
+    }
+    return result(outcome, what);
+  };
+
+  /** Uploads one file through X's chunked upload and returns its media id once X has processed it. */
+  async function upload(media: Media): Promise<string> {
+    const category = mediaCategory(media.contentType);
+    if (!category) throw new MediaError(`${media.source} is ${media.contentType}; X takes JPEG, PNG, WEBP, GIF, MP4 or MOV.`);
+    const tool = "x.upload_media";
+    const init = uploadStep(
+      await caller.proxy({
+        method: "POST",
+        url: `${X_API}/2/media/upload/initialize`,
+        json: { media_type: media.contentType, total_bytes: media.size, media_category: category },
+        tool,
+      }),
+      "start the media upload",
+    );
+    const id = (JSON.parse(init.body) as { data?: { id?: string } }).data?.id;
+    if (!id) throw new ProviderFailure("X did not return a media id for the upload.");
+    let sent = 0;
+    for (let segment = 0; sent < media.size; segment += 1) {
+      const chunk = await media.read(UPLOAD_SEGMENT_BYTES);
+      if (chunk.length === 0) throw new MediaError(`${media.source} ended before its declared size.`);
+      const { body, contentType } = multipartBody({ segment_index: String(segment) }, { name: "media", data: chunk });
+      uploadStep(
+        await caller.proxy({
+          method: "POST",
+          url: `${X_API}/2/media/upload/{id}/append`,
+          pathParams: { id },
+          body,
+          headers: { "Content-Type": contentType },
+          tool,
+        }),
+        "upload the media",
+      );
+      sent += chunk.length;
+    }
+    const finalized = uploadStep(
+      await caller.proxy({ method: "POST", url: `${X_API}/2/media/upload/{id}/finalize`, pathParams: { id }, tool }),
+      "finish the media upload",
+    );
+    let info = (JSON.parse(finalized.body) as { data?: { processing_info?: ProcessingInfo } }).data?.processing_info;
+    const deadline = Date.now() + PROCESSING_TIMEOUT_MS;
+    while (info && (info.state === "pending" || info.state === "in_progress")) {
+      if (Date.now() > deadline) {
+        throw new ProviderFailure(`X is still processing ${media.filename}; try the post again in a few minutes.`);
+      }
+      await sleep(Math.max(1, info.check_after_secs ?? 2) * 1000);
+      const status = uploadStep(
+        await caller.proxy({
+          method: "GET",
+          url: `${X_API}/2/media/upload`,
+          queryParams: { command: "STATUS", media_id: id },
+          tool,
+        }),
+        "check the media upload",
+      );
+      info = (JSON.parse(status.body) as { data?: { processing_info?: ProcessingInfo } }).data?.processing_info;
+    }
+    if (info?.state === "failed") {
+      throw new ProviderFailure(`X could not process ${media.filename}: ${info.error?.message ?? "processing failed"}.`);
+    }
+    return id;
+  }
+
+  /** Opens every source, checks the mix X allows, and returns them in order. */
+  async function openAll(sources: string[]): Promise<Media[]> {
+    const opened: Media[] = [];
+    try {
+      for (const source of sources) {
+        const media = await openMedia(source, MAX_VIDEO_BYTES, mediaOptions);
+        opened.push(media);
+        const category = mediaCategory(media.contentType);
+        if (!category) throw new MediaError(`${source} is ${media.contentType}; X takes JPEG, PNG, WEBP, GIF, MP4 or MOV.`);
+        if (media.size > maxBytesFor(category)) {
+          throw new MediaError(`${source} is ${formatBytes(media.size)}; X takes up to ${formatBytes(maxBytesFor(category))} for this type.`);
+        }
+      }
+      const kinds = opened.map((media) => mediaCategory(media.contentType));
+      if (kinds.length > 1 && kinds.some((kind) => kind !== "tweet_image")) {
+        throw new MediaError(`A post can carry up to ${MAX_IMAGES} images, or one GIF, or one video, not a mix.`);
+      }
+      return opened;
+    } catch (error) {
+      await Promise.all(opened.map((media) => media.close()));
+      throw error;
+    }
+  }
+
   server.registerTool(
     "create_post",
     {
       title: "Post on X",
-      description: `Publish a post from the connected account, or a reply when \`reply_to\` is set. With the recommended policy, this returns an approval link and nothing is posted until a person approves exactly this post. Accounts without X Premium are limited to ${STANDARD_POST_CHARS} characters; X refuses longer posts from them. X charges per post, and much more for a post that contains a URL.`,
+      description: `Publish a post from the connected account, or a reply when \`reply_to\` is set, optionally with images, a GIF or a video. With the recommended policy, this returns an approval link and nothing is posted until a person approves exactly this post; the approver sees where each attached file came from. Accounts without X Premium are limited to ${STANDARD_POST_CHARS} characters; X refuses longer posts from them. X charges per post, and much more for a post that contains a URL.`,
       inputSchema: {
         text: z.string().min(1).max(MAX_POST_CHARS),
         reply_to: postId.optional().describe("The id of the post to reply to."),
+        media: z
+          .array(z.string().min(1).max(2048))
+          .max(MAX_IMAGES)
+          .optional()
+          .describe(
+            `Up to ${MAX_IMAGES} images (JPEG, PNG, WEBP; 5 MB each), or one GIF (15 MB), or one video (MP4 or MOV, up to ${formatBytes(MAX_VIDEO_BYTES)}). Each is an https URL anyone can open, or, when the server runs on this computer, an absolute file path. Media is uploaded first; X keeps it for 24 hours if the post is not approved.`,
+          ),
         reason,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
-    ({ text, reply_to, reason: why }) =>
+    ({ text, reply_to, media, reason: why }) =>
       run("publish a post on X", async () => {
+        const opened = await openAll(media ?? []);
+        const mediaIds: string[] = [];
+        try {
+          for (const item of opened) mediaIds.push(await upload(item));
+        } finally {
+          await Promise.all(opened.map((item) => item.close()));
+        }
+        const fullReason = reasonWithMedia(why, opened);
         const response = result(
           await caller.proxy({
             method: "POST",
             url: `${X_API}/2/tweets`,
-            json: { text, ...(reply_to ? { reply: { in_reply_to_tweet_id: reply_to } } : {}) },
-            ...(why ? { reason: why } : {}),
+            json: {
+              text,
+              ...(reply_to ? { reply: { in_reply_to_tweet_id: reply_to } } : {}),
+              ...(mediaIds.length > 0 ? { media: { media_ids: mediaIds } } : {}),
+            },
+            ...(fullReason ? { reason: fullReason } : {}),
             tool: "x.create_post",
           }),
           "publish the post",

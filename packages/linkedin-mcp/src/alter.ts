@@ -50,12 +50,14 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
 }
 
 export interface ProxyArgs {
-  method: "GET" | "POST" | "PATCH";
+  method: "GET" | "POST" | "PATCH" | "PUT";
   url: string;
   /** `{name}` placeholders in `url`, URL-encoded by the SDK. */
   pathParams?: Record<string, string>;
   queryParams?: Record<string, string | number>;
   json?: unknown;
+  /** Raw bytes (a file or a multipart body); set its Content-Type in `headers`. Not with `json`. */
+  body?: Uint8Array;
   headers?: Record<string, string>;
   /** Shown to the approver when a policy holds the request. */
   reason?: string;
@@ -99,6 +101,7 @@ export function createAlterCaller(
         ...(args.pathParams ? { pathParams: args.pathParams } : {}),
         ...(args.queryParams ? { queryParams: args.queryParams } : {}),
         ...(args.json !== undefined ? { json: args.json } : {}),
+        ...(args.body !== undefined ? { body: args.body } : {}),
         ...(args.headers ? { extraHeaders: args.headers } : {}),
         ...(args.reason ? { reason: args.reason } : {}),
         context: { tool: args.tool, framework: "mcp", server: serverName },

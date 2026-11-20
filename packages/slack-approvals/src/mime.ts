@@ -10,6 +10,8 @@ export interface DecodedEmail {
   bcc?: string;
   subject?: string;
   text: string;
+  /** Files attached to the message: what the approver must know is going out. */
+  attachments: { filename: string; contentType: string; size: number }[];
 }
 
 function binaryFromBase64(data: string): string {
@@ -87,6 +89,36 @@ function textOf(part: Part): string | undefined {
   return /^text\/html/i.test(type) ? text.replace(/<[^>]+>/g, " ").replace(/[ \t]+/g, " ") : text;
 }
 
+function children(part: Part): Part[] {
+  const boundary = parameter(part.headers.get("content-type"), "boundary");
+  if (!boundary) return [];
+  return part.body
+    .split(`--${boundary}`)
+    .slice(1)
+    .filter((chunk) => !chunk.startsWith("--"))
+    .map((chunk) => parsePart(chunk.replace(/^\r?\n/, "")));
+}
+
+/** Every part sent as a file: marked as an attachment, or carrying a file name. */
+function attachmentsOf(part: Part): DecodedEmail["attachments"] {
+  const type = part.headers.get("content-type") ?? "text/plain";
+  if (/^multipart\//i.test(type)) return children(part).flatMap(attachmentsOf);
+  const disposition = part.headers.get("content-disposition");
+  const encoded = parameter(disposition, "filename\\*") ?? parameter(type, "name\\*");
+  let filename = parameter(disposition, "filename") ?? parameter(type, "name");
+  if (encoded) {
+    try {
+      filename = decodeURIComponent(encoded.replace(/^UTF-8''/i, ""));
+    } catch {
+      filename = encoded;
+    }
+  }
+  if (!/^attachment/i.test(disposition ?? "") && !filename) return [];
+  const encoding = (part.headers.get("content-transfer-encoding") ?? "7bit").toLowerCase();
+  const size = encoding === "base64" ? binaryFromBase64(part.body).length : part.body.length;
+  return [{ filename: decodeEncodedWords(filename ?? "unnamed"), contentType: type.split(";")[0]?.trim() ?? type, size }];
+}
+
 /** Decodes Gmail's `raw` field (base64url of the whole message). */
 export function decodeGmailRaw(raw: string): DecodedEmail {
   const part = parsePart(binaryFromBase64(raw.replace(/-/g, "+").replace(/_/g, "/")));
@@ -94,7 +126,7 @@ export function decodeGmailRaw(raw: string): DecodedEmail {
     const value = part.headers.get(name);
     return value === undefined ? undefined : decodeEncodedWords(decodeText(value));
   };
-  const email: DecodedEmail = { text: (textOf(part) ?? "").replace(/\r\n/g, "\n").trim() };
+  const email: DecodedEmail = { text: (textOf(part) ?? "").replace(/\r\n/g, "\n").trim(), attachments: attachmentsOf(part) };
   for (const name of ["from", "to", "cc", "bcc", "subject"] as const) {
     const value = header(name);
     if (value !== undefined) email[name] = value;

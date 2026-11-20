@@ -2,8 +2,12 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 import { createAlterCaller, loadConfig } from "./alter.js";
+import { type MediaOptions, rejectPrivateHost } from "./media.js";
 import { apiVersionFrom } from "./linkedin.js";
 import { SERVER_NAME, createLinkedInServer } from "./server.js";
+
+/** Running on the user's own computer: attachments may be local files, and URLs must be public. */
+const LOCAL_MEDIA: MediaOptions = { allowFiles: true, checkHost: rejectPrivateHost };
 
 async function main(): Promise<void> {
   let caller;
@@ -16,7 +20,7 @@ async function main(): Promise<void> {
     console.error(`${SERVER_NAME}: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   }
-  const server = createLinkedInServer(caller, { apiVersion });
+  const server = createLinkedInServer(caller, { apiVersion, media: LOCAL_MEDIA });
   const shutdown = async () => {
     await server.close();
     await caller.close();

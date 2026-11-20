@@ -10,11 +10,17 @@ Many Gmail MCP servers keep a Google token on the machine that runs them, and an
 |---|---|---|
 | `search_emails` | Searches with Gmail syntax (`from:alex@example.com newer_than:7d`); returns sender, recipients, subject, date, id and snippet | Allowed |
 | `read_email` | Reads one message: headers, plain-text body (HTML converted, long bodies cut), attachment names | Allowed |
-| `create_draft` | Writes a plain-text draft, optionally as a reply in a thread; nothing is sent | Allowed |
-| `send_email` | Sends a plain-text email, optionally as a reply | **Held until you approve it** |
+| `create_draft` | Writes a draft with your Gmail signature and any attachments, optionally as a reply in a thread; nothing is sent | Allowed |
+| `send_email` | Sends an email with your Gmail signature and any attachments, optionally as a reply | **Held until you approve it** |
 | `check_approval` | Reports what happened to a held request: waiting, done, denied, expired or failed | Allowed |
 
 Deleting mail is not a tool, and the recommended policy also blocks Gmail's delete operations for the agent.
+
+## Signature and attachments
+
+Gmail does not add your signature to mail sent through its API, so the server does: before each send or draft it reads the signature of the account's primary address from Gmail's send-as settings and adds it below the body, as plain text and as HTML (links and formatting kept), the way Gmail's editor does. If the signature cannot be read, nothing is sent; pass `include_signature: false` to go ahead without it. An account with no signature set sends without one, and the tool says so.
+
+`attachments` takes up to 10 files of any type (images, video, PDFs), 5 MB in total: Alter accepts requests up to 10 MB, and an attachment roughly doubles in size inside an email. Each file is an `https` URL anyone can open, or, when the server runs on your computer (`npx`), an absolute file path. A hosted server takes URLs only, and a local one refuses URLs that point at private network addresses. A file you drop into a chat cannot be passed to a remote MCP server, so put it at a URL first. The approver sees each file's name, type, size and source in the agent's reason.
 
 ## How a send works
 

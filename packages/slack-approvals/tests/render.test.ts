@@ -36,7 +36,7 @@ test("decodes a Gmail raw message: headers, encoded subject and UTF-8 body", () 
 
 test("decodes quoted-printable and multipart bodies", () => {
   const qp = Buffer.from('Subject: =?UTF-8?Q?Caf=C3=A9_time?=\r\nContent-Type: text/plain; charset="UTF-8"\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nCaf=C3=A9 at 3=\r\npm', "utf8").toString("base64url");
-  assert.deepEqual(decodeGmailRaw(qp), { subject: "Café time", text: "Café at 3pm" });
+  assert.deepEqual(decodeGmailRaw(qp), { subject: "Café time", text: "Café at 3pm", attachments: [] });
   const multipart = Buffer.from(
     'Content-Type: multipart/alternative; boundary="b1"\r\n\r\n--b1\r\nContent-Type: text/html\r\n\r\n<p>html</p>\r\n--b1\r\nContent-Type: text/plain\r\n\r\nplain text\r\n--b1--\r\n',
     "utf8",
@@ -105,4 +105,70 @@ test("a settled message keeps the content and replaces the buttons with the outc
   assert.ok(!JSON.stringify(settled).includes("Slack can only deny"));
   assert.match(JSON.stringify(settled.at(-1)), /Denied/);
   assert.equal(escapeSlack("<a&b>"), "&lt;a&amp;b&gt;");
+});
+
+test("a Gmail send with a signature and attachments lists each file the approver is sending", () => {
+  const b64 = (text: string) => Buffer.from(text, "utf8").toString("base64");
+  const message = [
+    "To: ana@example.com",
+    "Subject: Deck",
+    "MIME-Version: 1.0",
+    'Content-Type: multipart/mixed; boundary="m1"',
+    "",
+    "--m1",
+    'Content-Type: multipart/alternative; boundary="a1"',
+    "",
+    "--a1",
+    'Content-Type: text/plain; charset="UTF-8"',
+    "Content-Transfer-Encoding: base64",
+    "",
+    b64("See attached\r\n\r\n-- \r\nSam"),
+    "--a1",
+    'Content-Type: text/html; charset="UTF-8"',
+    "Content-Transfer-Encoding: base64",
+    "",
+    b64("<div>See attached</div>"),
+    "--a1--",
+    "",
+    "--m1",
+    "Content-Type: application/pdf; name*=UTF-8''r%C3%A9sum%C3%A9.pdf",
+    "Content-Disposition: attachment; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf",
+    "Content-Transfer-Encoding: base64",
+    "",
+    b64("PDF"),
+    "--m1",
+    'Content-Type: image/png; name="chart.png"',
+    'Content-Disposition: attachment; filename="chart.png"',
+    "Content-Transfer-Encoding: base64",
+    "",
+    Buffer.alloc(2048).toString("base64"),
+    "--m1--",
+    "",
+  ].join("\r\n");
+  const sections = contentSections({ body_as_sent: { raw: Buffer.from(message, "utf8").toString("base64url") } });
+  assert.equal(sections[1]?.text, "See attached\n\n-- \nSam");
+  assert.deepEqual(sections[2], { label: "Attachments (2)", text: "résumé.pdf (application/pdf, 3 B)\nchart.png (image/png, 2 KB)" });
+});
+
+test("a LinkedIn post with images or a video shows what is attached", () => {
+  const post = (content: unknown) => contentSections({ body_as_sent: { commentary: "Look", visibility: "PUBLIC", content } });
+  assert.deepEqual(post({ media: { id: "urn:li:image:I1", altText: "Bar chart" } })[1], {
+    label: "Media (1): the agent's reason says where each file came from",
+    text: "Image urn:li:image:I1: Bar chart",
+  });
+  assert.equal(post({ multiImage: { images: [{ id: "urn:li:image:I1" }, { id: "urn:li:image:I2" }] } })[1]?.text, "Image urn:li:image:I1\nImage urn:li:image:I2");
+  assert.equal(post({ media: { id: "urn:li:video:V1", title: "Demo" } })[1]?.text, "Video urn:li:video:V1: Demo");
+});
+
+test("an X post shows its text, the post it replies to, and its media", () => {
+  const sections = contentSections({
+    provider_id: "twitter",
+    body_as_sent: { text: "Launch day", reply: { in_reply_to_tweet_id: "190" }, media: { media_ids: ["111", "222"] } },
+  });
+  assert.deepEqual(sections, [
+    { label: "Post on X", text: "Launch day" },
+    { label: "In reply to", text: "https://x.com/i/status/190" },
+    { label: "Media (2): the agent's reason says where each file came from", text: "media 111\nmedia 222" },
+  ]);
+  assert.equal(contentSections({ provider_id: "notion", body_as_sent: { text: "x" } })[0]?.label, "Request body");
 });

@@ -73,6 +73,12 @@ export function titleOf(view: Pick<ApprovalView, "summary" | "context">): string
   return `${str(view.summary.method) ?? "Request"} ${str(view.summary.host) ?? ""}${str(view.summary.path_summary) ?? ""}`.trim();
 }
 
+function formatBytes(size: number): string {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 /** The request's content as labelled sections, from what Alter will send. */
 export function contentSections(summary: Readonly<Record<string, unknown>>): { label: string; text: string }[] {
   const body = record(summary.body_as_sent) ?? record(record(summary.request_as_sent)?.body);
@@ -91,18 +97,49 @@ export function contentSections(summary: Readonly<Record<string, unknown>>): { l
       .filter((name) => email[name])
       .map((name) => `${name[0]?.toUpperCase()}${name.slice(1)}: ${email[name]}`)
       .join("\n");
-    return [
+    const sections = [
       { label: "Email", text: headers || "(no headers)" },
       { label: "Message", text: email.text || "(empty)" },
     ];
+    if (email.attachments.length > 0) {
+      sections.push({
+        label: `Attachments (${email.attachments.length})`,
+        text: email.attachments.map((file) => `${file.filename} (${file.contentType}, ${formatBytes(file.size)})`).join("\n"),
+      });
+    }
+    return sections;
   }
   const commentary = str(body.commentary);
   if (commentary !== undefined) {
     const sections = [{ label: `Post (${str(body.visibility) ?? "PUBLIC"})`, text: unescapeLittleText(commentary) }];
-    const article = record(record(body.content)?.article);
+    const content = record(body.content);
+    const article = record(content?.article);
     if (article) {
       const card = [str(article.title), str(article.description), str(article.source)].filter(Boolean).join("\n");
       sections.push({ label: "Link card", text: card });
+    }
+    const media = record(content?.media);
+    const images = Array.isArray(record(content?.multiImage)?.images) ? (record(content?.multiImage)?.images as unknown[]).map(record) : [];
+    const attached = media ? [media] : images;
+    if (attached.length > 0) {
+      const lines = attached.map((item) => {
+        const id = str(item?.id) ?? "unknown";
+        const label = id.startsWith("urn:li:video:") ? "Video" : "Image";
+        const detail = str(item?.altText) ?? str(item?.title);
+        return `${label} ${id}${detail ? `: ${detail}` : ""}`;
+      });
+      sections.push({ label: `Media (${attached.length}): the agent's reason says where each file came from`, text: lines.join("\n") });
+    }
+    return sections;
+  }
+  const postText = str(body.text);
+  if (postText !== undefined && str(summary.provider_id) === "twitter") {
+    const sections = [{ label: "Post on X", text: postText }];
+    const reply = str(record(body.reply)?.in_reply_to_tweet_id);
+    if (reply) sections.push({ label: "In reply to", text: `https://x.com/i/status/${reply}` });
+    const ids = Array.isArray(record(body.media)?.media_ids) ? (record(body.media)?.media_ids as unknown[]).map(String) : [];
+    if (ids.length > 0) {
+      sections.push({ label: `Media (${ids.length}): the agent's reason says where each file came from`, text: ids.map((id) => `media ${id}`).join("\n") });
     }
     return sections;
   }

@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import type { AlterCaller, ApprovalOutcome, ProxyArgs, ProxyOutcome } from "../src/alter.js";
+import type { MediaOptions } from "../src/media.js";
 import { createGmailServer } from "../src/server.js";
 import { VERSION } from "../src/version.js";
 
@@ -33,8 +36,8 @@ const json = (status: number, value: unknown): ProxyOutcome => ({
   body: JSON.stringify(value),
 });
 
-async function connect(caller: AlterCaller) {
-  const server = createGmailServer(caller, { log: () => {} });
+async function connect(caller: AlterCaller, media?: MediaOptions) {
+  const server = createGmailServer(caller, { log: () => {}, ...(media ? { media } : {}) });
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
   await server.connect(serverSide);
   const client = new Client({ name: "test", version: "0.0.0" });
@@ -48,6 +51,8 @@ function textOf(result: unknown): string {
 }
 
 const decodeRaw = (raw: string) => Buffer.from(raw, "base64url").toString("utf8");
+
+const NO_SIGNATURE = { sendAs: [{ sendAsEmail: "me@example.com", isPrimary: true, signature: "" }] };
 
 test("version matches package.json", () => {
   const pkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as {
@@ -94,12 +99,16 @@ test("search returns headers and snippets, and labels the content untrusted", as
 });
 
 test("a held send returns the approval link and says nothing was sent", async () => {
-  const { caller, calls } = fakeCaller(() => ({
-    kind: "pending",
-    approvalId: "ap_123",
-    approvalUrls: ["https://wallet.example.com/approvals/ap_123"],
-    expiresAt: "2026-11-20T21:00:00.000Z",
-  }));
+  const { caller, calls } = fakeCaller((args) =>
+    args.method === "GET"
+      ? json(200, NO_SIGNATURE)
+      : {
+          kind: "pending",
+          approvalId: "ap_123",
+          approvalUrls: ["https://wallet.example.com/approvals/ap_123"],
+          expiresAt: "2026-11-20T21:00:00.000Z",
+        },
+  );
   const client = await connect(caller);
   const result = await client.callTool({
     name: "send_email",
@@ -116,7 +125,8 @@ test("a held send returns the approval link and says nothing was sent", async ()
   assert.match(text, /Nothing has happened yet/);
   assert.match(text, /https:\/\/wallet\.example\.com\/approvals\/ap_123/);
   assert.match(text, /ap_123/);
-  const call = calls[0];
+  assert.equal(calls[0]?.url, "https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs");
+  const call = calls[1];
   assert.equal(call?.url, "https://gmail.googleapis.com/gmail/v1/users/me/messages/send");
   assert.equal(call?.reason, "Second touch after the intro email");
   const raw = decodeRaw((call?.json as { raw: string }).raw);
@@ -125,6 +135,7 @@ test("a held send returns the approval link and says nothing was sent", async ()
 
 test("a reply draft threads under the original message", async () => {
   const { caller, calls } = fakeCaller((args) => {
+    if (args.url.endsWith("/settings/sendAs")) return json(200, NO_SIGNATURE);
     if (args.method === "GET") {
       return json(200, {
         id: "m9",
@@ -146,7 +157,7 @@ test("a reply draft threads under the original message", async () => {
     arguments: { to: ["sam@example.com"], subject: "", body: "Here are the details", reply_to_message_id: "m9" },
   });
   assert.match(textOf(result), /Draft created \(draft id d1\)/);
-  const draftCall = calls[1];
+  const draftCall = calls.find((call) => call.method === "POST");
   const message = (draftCall?.json as { message: { raw: string; threadId?: string } }).message;
   assert.equal(message.threadId, "t9");
   const raw = decodeRaw(message.raw);
@@ -205,4 +216,128 @@ test("check_approval explains a denial", async () => {
   );
   const result = await client.callTool({ name: "check_approval", arguments: { approval_id: "ap_1" } });
   assert.match(textOf(result), /Denied: Wrong recipient\. Nothing was sent\./);
+});
+
+// Signatures and attachments.
+
+const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4, 5, 6, 7, 8]);
+
+function serve(files: Record<string, Uint8Array<ArrayBuffer>>): typeof fetch {
+  return (async (input: string | URL | Request) => {
+    const file = files[String(input instanceof Request ? input.url : input)];
+    if (!file) return new Response("missing", { status: 404 });
+    return new Response(file, { status: 200, headers: { "content-length": String(file.length), "content-type": "application/octet-stream" } });
+  }) as typeof fetch;
+}
+
+/** Every leaf part of a MIME message, in order, with base64 bodies decoded. */
+function mimeParts(message: string): { head: string; bytes: Buffer }[] {
+  const out: { head: string; bytes: Buffer }[] = [];
+  const visit = (chunk: string) => {
+    const split = chunk.indexOf("\r\n\r\n");
+    const head = chunk.slice(0, split);
+    const body = chunk.slice(split + 4);
+    const mark = head.match(/boundary="([^"]+)"/)?.[1];
+    if (mark) {
+      for (const piece of body.split(`--${mark}`).slice(1)) if (!piece.startsWith("--")) visit(piece.replace(/^\r\n/, ""));
+      return;
+    }
+    out.push({ head, bytes: /base64/i.test(head) ? Buffer.from(body.replace(/\s/g, ""), "base64") : Buffer.from(body) });
+  };
+  visit(message);
+  return out;
+}
+
+const SIGNATURE = '<div dir="ltr">Srikar Dandamuraju<br><a href="https://alterauth.com">Alter</a> &amp; friends</div>';
+
+test("the primary address's signature is added below the body, in text and HTML", async () => {
+  const { caller, calls } = fakeCaller((args) =>
+    args.method === "GET"
+      ? json(200, { sendAs: [{ sendAsEmail: "alias@example.com", signature: "<b>alias</b>" }, { sendAsEmail: "me@example.com", isPrimary: true, signature: SIGNATURE }] })
+      : json(200, { id: "s1" }),
+  );
+  const client = await connect(caller);
+  const result = await client.callTool({ name: "send_email", arguments: { to: ["dana@example.com"], subject: "Hi", body: "Line one\nLine <two>" } });
+  assert.match(textOf(result), /your Gmail signature added/);
+  const raw = decodeRaw((calls[1]?.json as { raw: string }).raw);
+  assert.match(raw, /\r\nContent-Type: multipart\/alternative; boundary="alter_[0-9a-f]+"\r\n/);
+  const [text, html] = mimeParts(raw);
+  assert.match(text?.head ?? "", /text\/plain/);
+  assert.equal(text?.bytes.toString("utf8"), "Line one\r\nLine <two>\r\n\r\n-- \r\nSrikar Dandamuraju\r\nAlter <https://alterauth.com> & friends");
+  assert.match(html?.head ?? "", /text\/html/);
+  const htmlText = html?.bytes.toString("utf8") ?? "";
+  assert.match(htmlText, /Line one<br>Line &lt;two&gt;/);
+  assert.ok(htmlText.includes(`class="gmail_signature">${SIGNATURE}</div>`));
+  assert.ok(!htmlText.includes("alias"));
+});
+
+test("include_signature false sends without reading the signature", async () => {
+  const { caller, calls } = fakeCaller(() => json(200, { id: "s1" }));
+  const client = await connect(caller);
+  await client.callTool({ name: "send_email", arguments: { to: ["dana@example.com"], subject: "Hi", body: "x", include_signature: false } });
+  assert.equal(calls.length, 1);
+  assert.match(decodeRaw((calls[0]?.json as { raw: string }).raw), /Content-Type: text\/plain/);
+});
+
+test("a signature that cannot be read stops the send and says how to go ahead", async () => {
+  const { caller, calls } = fakeCaller(() => json(403, { error: { message: "Insufficient Permission" } }));
+  const client = await connect(caller);
+  const result = await client.callTool({ name: "send_email", arguments: { to: ["dana@example.com"], subject: "Hi", body: "x" } });
+  assert.equal((result as { isError?: boolean }).isError, true);
+  assert.match(textOf(result), /Could not read the Gmail signature, so nothing was sent.*Insufficient Permission.*include_signature to false/s);
+  assert.equal(calls.length, 1);
+});
+
+test("attachments are added to the message and named in the approval reason", async () => {
+  const { caller, calls } = fakeCaller((args) =>
+    args.method === "GET"
+      ? json(200, NO_SIGNATURE)
+      : { kind: "pending", approvalId: "ap_9", approvalUrls: ["https://wallet.example.com/approvals/ap_9"], expiresAt: "2026-11-21T00:00:00.000Z" },
+  );
+  const client = await connect(caller, { allowFiles: false, fetch: serve({ "https://cdn.example.com/img/chart%20one.png": PNG }) });
+  await client.callTool({
+    name: "send_email",
+    arguments: { to: ["dana@example.com"], subject: "Chart", body: "See attached", reason: "Share the chart", attachments: ["https://cdn.example.com/img/chart%20one.png"] },
+  });
+  const send = calls[1];
+  assert.equal(send?.reason, "Share the chart\nAttached (1):\n- chart one.png (image/png, 16 B) from https://cdn.example.com/img/chart%20one.png");
+  const raw = decodeRaw((send?.json as { raw: string }).raw);
+  assert.match(raw, /\r\nContent-Type: multipart\/mixed; boundary=/);
+  const [body, file] = mimeParts(raw);
+  assert.equal(body?.bytes.toString("utf8"), "See attached");
+  assert.match(file?.head ?? "", /Content-Type: image\/png; name="chart one\.png"\r\nContent-Disposition: attachment; filename="chart one\.png"/);
+  assert.deepEqual(new Uint8Array(file?.bytes ?? []), PNG);
+});
+
+test("attachments over the total limit are refused before anything is sent", async () => {
+  const big = new Uint8Array(5 * 1024 * 1024 + 1);
+  big.set(PNG);
+  const { caller, calls } = fakeCaller(() => json(200, NO_SIGNATURE));
+  const client = await connect(caller, { allowFiles: false, fetch: serve({ "https://cdn.example.com/big.png": big }) });
+  const result = await client.callTool({
+    name: "send_email",
+    arguments: { to: ["dana@example.com"], subject: "Big", body: "x", attachments: ["https://cdn.example.com/big.png"] },
+  });
+  assert.equal((result as { isError?: boolean }).isError, true);
+  assert.match(textOf(result), /big\.png is 5\.0 MB; the limit here is 5\.0 MB/);
+  assert.ok(calls.every((call) => call.method === "GET"));
+});
+
+test("a file path is refused on a hosted server, and read from disk when the server is local", async () => {
+  const path = join(mkdtempSync(join(tmpdir(), "gmail-mcp-")), "deck.pdf");
+  writeFileSync(path, "%PDF-1.7 tiny");
+  const hosted = fakeCaller(() => json(200, NO_SIGNATURE));
+  const refused = await (await connect(hosted.caller)).callTool({
+    name: "create_draft",
+    arguments: { to: ["dana@example.com"], subject: "Deck", body: "x", attachments: [path] },
+  });
+  assert.match(textOf(refused), /File paths work only when the server runs on your computer/);
+  const local = fakeCaller((args) => (args.method === "GET" ? json(200, NO_SIGNATURE) : json(200, { id: "d1" })));
+  const created = await (await connect(local.caller, { allowFiles: true })).callTool({
+    name: "create_draft",
+    arguments: { to: ["dana@example.com"], subject: "Deck", body: "x", attachments: [path] },
+  });
+  assert.match(textOf(created), /1 attachment\(s\): deck\.pdf/);
+  const raw = decodeRaw((local.calls[1]?.json as { message: { raw: string } }).message.raw);
+  assert.equal(mimeParts(raw)[1]?.bytes.toString("utf8"), "%PDF-1.7 tiny");
 });
