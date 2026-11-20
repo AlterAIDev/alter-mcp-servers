@@ -5,3 +5,5 @@ dist-test/
 .env
 .env.*
 .DS_Store
+.wrangler/
+.dev.vars

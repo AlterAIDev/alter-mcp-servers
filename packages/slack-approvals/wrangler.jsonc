@@ -1,0 +1,15 @@
+{
+  // Alter approvals in Slack. Secrets (never commit values):
+  //   npx wrangler secret put ALTER_APPROVALS_KEY    # app key: approvals:read approvals:decide
+  //   npx wrangler secret put ALTER_WEBHOOK_SECRET   # signing_secret from `alter webhooks create`
+  //   npx wrangler secret put SLACK_BOT_TOKEN        # xoxb-...
+  //   npx wrangler secret put SLACK_SIGNING_SECRET
+  //   npx wrangler secret put SLACK_CHANNEL_ID       # e.g. C0123456789
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "alter-slack-approvals",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-11-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": { "enabled": true }
+}

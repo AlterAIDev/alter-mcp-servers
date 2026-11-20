@@ -7,6 +7,10 @@ Open-source MCP servers for AI agents where **the server never holds the provide
 | [Gmail](packages/gmail-mcp) | `@alter-ai/gmail-mcp` | Search, read, draft and send email; sends held for approval |
 | [LinkedIn](packages/linkedin-mcp) | `@alter-ai/linkedin-mcp` | Post, comment and react through LinkedIn's official API only; posts held for approval |
 
+Run each server locally over stdio (`npx`), or host it as a multi-user Cloudflare Worker: everyone in your organization signs in through your Alter app's identity provider and works with their own account, under your Alter policies (see each package's "Host on Cloudflare").
+
+[`slack-approvals`](packages/slack-approvals) is a companion Cloudflare Worker: it posts each held request to a Slack channel, showing exactly what Alter will send, with Approve and Deny buttons.
+
 ## Why build an MCP server this way
 
 - **No token on the machine running the agent.** A leaked agent key reaches only what its policies allow, and you can revoke it in one place.
@@ -29,7 +33,7 @@ Each package README covers its setup: an Alter app, the provider, an agent, conn
 ```bash
 pnpm install
 pnpm typecheck
-pnpm test     # also checks that every package's src/alter.ts is identical
+pnpm test     # also checks that every server's src/alter.ts and src/hosted.ts are identical
 pnpm build
 ```
 

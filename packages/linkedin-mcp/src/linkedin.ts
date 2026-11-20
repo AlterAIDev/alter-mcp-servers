@@ -9,6 +9,9 @@ export const DEFAULT_API_VERSION = "202609";
 
 export const MAX_POST_CHARS = 3000;
 export const MAX_COMMENT_CHARS = 1250;
+/** Article link cards: LinkedIn truncates longer titles and descriptions in the card. */
+export const MAX_LINK_TITLE_CHARS = 200;
+export const MAX_LINK_DESCRIPTION_CHARS = 300;
 
 export const REACTIONS = ["LIKE", "PRAISE", "EMPATHY", "INTEREST", "APPRECIATION", "ENTERTAINMENT"] as const;
 

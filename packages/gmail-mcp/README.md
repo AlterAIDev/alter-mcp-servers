@@ -20,7 +20,7 @@ Deleting mail is not a tool, and the recommended policy also blocks Gmail's dele
 
 1. The agent calls `send_email`. The request reaches Alter, which matches your approval rule and holds the exact request, encrypted.
 2. The tool returns an approval link and an approval id. Nothing has been sent.
-3. You open the link in the Alter Wallet. It shows the operation and the recipients, sender and subject the policy reads, plus the agent's `reason`.
+3. You open the link in the Alter Wallet (or see the request in Slack, with [`slack-approvals`](../slack-approvals)). It shows the operation and the recipients, sender and subject the policy reads, plus the agent's `reason`.
 4. You approve or deny. On approval Alter sends exactly the held request, once, even if the agent has stopped. On denial nothing is sent.
 5. The agent (or you) can call `check_approval` with the id to see the outcome.
 
@@ -95,6 +95,48 @@ Claude Desktop, Cursor and other clients (`mcpServers` in the client's config fi
 ```
 
 Until the first npm release, build from source (`pnpm install && pnpm build` at the repository root) and use `node packages/gmail-mcp/dist/index.js` as the command.
+
+## Host on Cloudflare (remote, multi-user MCP)
+
+Run the server as a Cloudflare Worker so claude.ai, Claude Code and other clients connect to it over HTTPS, and scheduled agents can use it while your computer is off. Hosted, the server is **multi-user**: everyone in your organization signs in with the identity provider already configured on your Alter app (Clerk, Auth0, Okta, WorkOS or another OIDC provider), and each person's requests go through **their own Gmail**, under the policies set in Alter, recorded as them. The Worker holds no identity-provider secret and no Gmail credential.
+
+What happens when someone connects a client:
+
+1. The client registers itself and opens the Worker's consent page, which names the client and where its access will go.
+2. They choose **Allow and sign in**. A window opens with your app's sign-in page, through Alter.
+3. The Worker checks they are on `ALLOWED_USERS`, then asks Alter, with their identity-provider token, for their own Gmail connection delegated to this server's agent. If they have none yet, the page offers **Connect Gmail**: they connect it once through Alter Connect, delegated to the agent.
+4. The client gets a token for this server bound to that one connection. Every tool call uses it, so nobody can reach another person's Gmail. Tokens are stored hashed in Workers KV.
+
+One agent serves everyone: its rules (for example "approve every send") apply to all of them, and each person's own rules in Alter apply on top.
+
+**1. An Alter app key for sign-in and connecting** (separate from the agent key). The key is printed once, in the `plain_key` field:
+
+```bash
+alter keys mint --app <app-id> --name mcp-hosted \
+  --scopes idp_users:read,idp_users:write,connect:initiate,grants:write --output json | jq -r '.plain_key'
+```
+
+**2. Deploy** from `packages/gmail-mcp`, then set the secrets. The first deploy creates the Worker's KV namespace.
+
+```bash
+npx wrangler deploy
+npx wrangler secret put ALTER_AGENT_API_KEY
+npx wrangler secret put ALTER_SIGNIN_KEY
+npx wrangler secret put ALLOWED_USERS
+```
+
+`ALLOWED_USERS` is a comma-separated list of identity-provider user ids, emails, whole email domains (`@example.com`), or `*` for anyone your identity provider signs in. Prefer user ids, or a domain your provider verifies, when people can sign up with an email they have not verified. `ALTER_ACCOUNT` and `ALTER_GRANT_ID` do not apply, since each person's connection is chosen at sign-in.
+
+**3. Connect a client** to `https://alter-gmail-mcp.<your-subdomain>.workers.dev/mcp` and sign in when asked:
+
+- claude.ai: **Settings**, **Connectors**, **Add custom connector**.
+- Claude Code: `claude mcp add --transport http gmail https://alter-gmail-mcp.<your-subdomain>.workers.dev/mcp`, then `/mcp` to sign in.
+
+If someone reconnects their Gmail in Alter later, their client's next call is refused until they sign in again, which picks up the new connection.
+
+Start sign-ins only from your MCP client, and never complete a sign-in link someone sends you: Alter's sign-in is link-based, so whoever started the sign-in gets the access.
+
+To approve held requests from Slack instead of the Wallet, add [`slack-approvals`](../slack-approvals).
 
 ## Configuration
 

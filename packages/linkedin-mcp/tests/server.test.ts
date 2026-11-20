@@ -101,6 +101,38 @@ test("a published post returns its URL from the x-restli-id header", async () =>
   assert.match(textOf(result), /https:\/\/www\.linkedin\.com\/feed\/update\/urn:li:share:7001\//);
 });
 
+test("a post with a link attaches it as an article card", async () => {
+  const { caller, calls } = fakeCaller(() => ({ kind: "result", status: 201, headers: {}, body: "" }));
+  const client = await connect(caller);
+  await client.callTool({
+    name: "create_post",
+    arguments: {
+      text: "New article",
+      link: { url: "https://example.com/blog/post?utm_source=linkedin", title: "The post", description: "What it covers" },
+    },
+  });
+  const post = calls.find((call) => call.url.endsWith("/rest/posts"));
+  const body = post?.json as { content?: unknown };
+  assert.deepEqual(body.content, {
+    article: { source: "https://example.com/blog/post?utm_source=linkedin", title: "The post", description: "What it covers" },
+  });
+});
+
+test("a post without a link carries no content, and a non-https link is refused", async () => {
+  const { caller, calls } = fakeCaller(() => ({ kind: "result", status: 201, headers: {}, body: "" }));
+  const client = await connect(caller);
+  await client.callTool({ name: "create_post", arguments: { text: "Plain" } });
+  const plain = calls.find((call) => call.url.endsWith("/rest/posts"));
+  assert.equal((plain?.json as { content?: unknown }).content, undefined);
+
+  const refused = await client.callTool({
+    name: "create_post",
+    arguments: { text: "Bad link", link: { url: "http://example.com/post", title: "Insecure" } },
+  });
+  assert.equal(refused.isError, true);
+  assert.equal(calls.filter((call) => call.url.endsWith("/rest/posts")).length, 1);
+});
+
 test("comments go to the post's socialActions path as the member", async () => {
   const { caller, calls } = fakeCaller(() => ({ kind: "result", status: 201, headers: {}, body: "{}" }));
   const client = await connect(caller);

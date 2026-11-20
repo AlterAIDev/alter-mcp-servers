@@ -1,0 +1,19 @@
+{
+  "name": "@alter-ai/slack-approvals",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Approve or deny Alter's held agent requests from Slack: a Cloudflare Worker that turns Alter's approval webhooks into Slack messages showing exactly what will be sent.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/tests/*.test.js",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@alter-ai/alter-sdk": "^0.34.1"
+  },
+  "devDependencies": {
+    "wrangler": "4.162.0"
+  }
+}

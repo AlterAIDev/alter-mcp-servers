@@ -12,6 +12,8 @@ import {
   DEFAULT_API_VERSION,
   LINKEDIN,
   MAX_COMMENT_CHARS,
+  MAX_LINK_DESCRIPTION_CHARS,
+  MAX_LINK_TITLE_CHARS,
   MAX_POST_CHARS,
   POST_URN,
   REACTIONS,
@@ -130,15 +132,23 @@ export function createLinkedInServer(caller: AlterCaller, options: ServerOptions
     "create_post",
     {
       title: "Post on LinkedIn",
-      description: `Publish a text post on the member's profile through LinkedIn's official API. With the recommended policy, this returns an approval link and nothing is posted until a person approves exactly this post in the Alter Wallet. Up to ${MAX_POST_CHARS} characters; links appear as written, and hashtags appear as plain text.`,
+      description: `Publish a text post on the member's profile through LinkedIn's official API. With the recommended policy, this returns an approval link and nothing is posted until a person approves exactly this post. Up to ${MAX_POST_CHARS} characters; hashtags appear as plain text. To share an article, pass \`link\`: LinkedIn shows it as a card with the title and description (no image), which a URL inside the text does not get.`,
       inputSchema: {
         text: z.string().min(1).max(MAX_POST_CHARS),
         visibility: z.enum(["PUBLIC", "CONNECTIONS"]).default("PUBLIC"),
+        link: z
+          .object({
+            url: z.url({ protocol: /^https$/ }).describe("The article's https URL."),
+            title: z.string().min(1).max(MAX_LINK_TITLE_CHARS),
+            description: z.string().max(MAX_LINK_DESCRIPTION_CHARS).optional(),
+          })
+          .optional()
+          .describe("An article to attach as a link card."),
         reason,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
-    ({ text, visibility, reason: why }) =>
+    ({ text, visibility, link, reason: why }) =>
       run("publish a LinkedIn post", async () => {
         const response = result(
           await caller.proxy({
@@ -150,6 +160,17 @@ export function createLinkedInServer(caller: AlterCaller, options: ServerOptions
               commentary: escapeLittleText(text),
               visibility,
               distribution: { feedDistribution: "MAIN_FEED", targetEntities: [], thirdPartyDistributionChannels: [] },
+              ...(link
+                ? {
+                    content: {
+                      article: {
+                        source: link.url,
+                        title: link.title,
+                        ...(link.description ? { description: link.description } : {}),
+                      },
+                    },
+                  }
+                : {}),
               lifecycleState: "PUBLISHED",
               isReshareDisabledByAuthor: false,
             },

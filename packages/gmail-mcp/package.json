@@ -55,5 +55,9 @@
     "ai-agents",
     "human-in-the-loop",
     "alter"
-  ]
+  ],
+  "devDependencies": {
+    "@cloudflare/workers-oauth-provider": "1.2.4",
+    "wrangler": "4.162.0"
+  }
 }
