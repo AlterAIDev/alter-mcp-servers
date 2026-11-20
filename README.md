@@ -11,6 +11,8 @@ Open-source MCP servers for AI agents where **the server never holds the provide
 | [X (Twitter)](packages/x-mcp) | `@alter-ai/x-mcp` | `get_profile`, `search_posts`, `get_mentions`, `create_post`, `like_post`, `repost`, `check_approval` | Posts, likes and reposts |
 | [Notion](packages/notion-mcp) | `@alter-ai/notion-mcp` | `search`, `read_page`, `query_database`, `create_page`, `append_to_page`, `add_comment`, `check_approval` | Optional: new pages and comments |
 
+Gmail sends and drafts carry your Gmail signature and attachments; LinkedIn posts take images or a video, and X posts take images, a GIF or a video. Files come from a public URL, or a local file when the server runs on your computer, and the approver sees where each one came from.
+
 Every server uses only the provider's official API, and the recommended policy blocks deletes on all of them. Each package README lists its tools in detail, with the setup and the policies.
 
 Run a server locally over stdio (`npx`), or host it as a multi-user Cloudflare Worker: everyone in your organization signs in through your Alter app's identity provider and works with their own account, under your Alter policies (see each package's "Host on Cloudflare"). Until the first npm release, build from source (`pnpm install && pnpm build`).

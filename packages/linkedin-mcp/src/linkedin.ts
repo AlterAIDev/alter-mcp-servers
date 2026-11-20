@@ -37,3 +37,34 @@ export function escapeLittleText(text: string): string {
 export function postUrl(urn: string): string {
   return `https://www.linkedin.com/feed/update/${urn}/`;
 }
+
+// Media: the Images and Videos APIs.
+// https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/images-api
+// https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/videos-api
+
+/** A post carries one image, 2 to 20 images (a multi-image post), or one video. */
+export const MAX_IMAGES = 20;
+/** LinkedIn states no image size limit; Alter accepts requests up to 10 MB. */
+export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+export const IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif"];
+/** LinkedIn's video limits: MP4, 75 KB to 500 MB, 3 seconds to 30 minutes. */
+export const MIN_VIDEO_BYTES = 75 * 1024;
+export const MAX_VIDEO_BYTES = 500 * 1024 * 1024;
+export const MAX_ALT_TEXT_CHARS = 4086;
+export const MAX_VIDEO_TITLE_CHARS = 400;
+
+/** LinkedIn's upload URLs: https on www.linkedin.com under /dms-uploads/. */
+export function isLinkedInUploadUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && url.hostname === "www.linkedin.com" && url.pathname.startsWith("/dms-uploads/");
+  } catch {
+    return false;
+  }
+}
+
+export interface UploadInstruction {
+  uploadUrl: string;
+  firstByte: number;
+  lastByte: number;
+}

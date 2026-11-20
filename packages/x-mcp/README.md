@@ -9,12 +9,18 @@ An X MCP server for AI agents that searches, reads mentions, posts, likes and re
 | `get_profile` | The connected account's name, handle, user id and follower counts | Allowed |
 | `search_posts` | Searches posts from the last 7 days with X's search syntax (`"mcp server" -is:retweet lang:en`); returns author, time, link, engagement and text | Allowed |
 | `get_mentions` | The most recent posts that mention the connected account | Allowed |
-| `create_post` | Publishes a post, or a reply with `reply_to` | **Held until you approve it** |
+| `create_post` | Publishes a post, or a reply with `reply_to`, optionally with up to 4 images, a GIF or a video (`media`) | **Held until you approve it** |
 | `like_post` | Likes a post | **Held until you approve it** |
 | `repost` | Reposts a post | **Held until you approve it** |
 | `check_approval` | Reports what happened to a held request | Allowed |
 
 Direct messages are not a tool: cold DMs are where automated accounts get restricted.
+
+## Images and video
+
+`create_post` takes `media`: up to 4 images (JPEG, PNG or WEBP, 5 MB each), or one GIF (15 MB), or one video (MP4 or MOV, up to 512 MB), never a mix. Each file is an `https` URL anyone can open, or, when the server runs on your computer (`npx`), an absolute file path. A hosted server takes URLs only, and a local one refuses URLs that point at private network addresses. A file you drop into a chat cannot be passed to a remote MCP server, so put it at a URL first.
+
+The server uploads each file through Alter with X's chunked upload (4 MB pieces), waits for X to finish processing a video, then submits the post with the media attached. The post is what waits for approval: the approver sees the post and, in the agent's reason, each file's name, type, size and source. If the post is denied, X discards the unused media after 24 hours.
 
 ## X charges for API use
 
@@ -33,13 +39,13 @@ You need an Alter account and the [`alter` CLI](https://docs.alterauth.com/refer
 
 **1. An Alter app with an identity provider** (Auth0, Clerk, Okta, WorkOS or another OIDC provider), so you can delegate your X account to an agent. See [identity providers](https://docs.alterauth.com/admin/identity-provider).
 
-**2. X as a provider.** In the [X developer portal](https://developer.x.com/en/portal/dashboard), create an app, turn on OAuth 2.0 as a **Web App**, add Alter's callback URL, and copy the client ID and secret. Add X (provider `twitter`) to your Alter app with the scopes `tweet.read`, `tweet.write`, `users.read`, `like.write` and `offline.access`. See [X provider setup](https://docs.alterauth.com/reference/oauth-providers/twitter).
+**2. X as a provider.** In the [X developer portal](https://developer.x.com/en/portal/dashboard), create an app, turn on OAuth 2.0 as a **Web App**, add Alter's callback URL, and copy the client ID and secret. Add X (provider `twitter`) to your Alter app with the scopes `tweet.read`, `tweet.write`, `users.read`, `like.write`, `media.write` and `offline.access`. See [X provider setup](https://docs.alterauth.com/reference/oauth-providers/twitter).
 
 **3. An agent.** The key is printed once, in the `api_key` field:
 
 ```bash
 alter agents create --app <app-id> --name x-agent \
-  --scopes '{"twitter":["tweet.read","tweet.write","users.read","like.write","offline.access"]}' \
+  --scopes '{"twitter":["tweet.read","tweet.write","users.read","like.write","media.write","offline.access"]}' \
   --output json | jq -r '.api_key'
 ```
 
@@ -49,10 +55,10 @@ alter agents create --app <app-id> --name x-agent \
 alter connect create --provider twitter --user-token "$USER_JWT" --agent x-agent --output json
 ```
 
-**5. Policies.** Hold posts, likes and reposts for approval for up to 24 hours, and block deletes. Alter classifies posting as a `send` operation and likes and reposts as `write`:
+**5. Policies.** Hold posts, likes and reposts for approval for up to 24 hours, and block deletes. Alter classifies posting as a `send` operation, and likes, reposts and media uploads as `write`. An upload is not visible to anyone until the post carrying it is published, so the rule holds posts and names the like and repost operations rather than holding every `write` (which would stop each upload piece for approval):
 
 ```bash
-echo '{"effect": "require_approval", "when": {"match": {"families": ["send", "write"]}}, "approval": {"approvers": ["you@example.com"], "channels": ["email"], "expires_in_seconds": 86400}}' | \
+echo '{"effect": "require_approval", "when": {"match": {"families": ["send"], "operations": ["likePost", "repostPost"]}}, "approval": {"approvers": ["you@example.com"], "channels": ["email"], "expires_in_seconds": 86400}}' | \
   alter policy rules create --app <app-id> --agent <agent-id> --type require_approval --body - --name "Approve every post, like and repost"
 
 echo '{"when": {"family": ["delete"]}, "effect": "deny"}' | \

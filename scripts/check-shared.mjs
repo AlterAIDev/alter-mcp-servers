@@ -2,17 +2,22 @@
 // package publishes on its own with no internal dependency:
 // - src/alter.ts: the Alter client, approval handling and error messages
 // - src/hosted.ts: remote hosting on Cloudflare, signing people in through Alter
+// - src/media.ts: reading images, video and files to attach (only the servers that attach media)
 // This check keeps the copies from drifting.
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
-const SHARED = ["alter.ts", "hosted.ts"];
 const root = new URL("../packages/", import.meta.url).pathname;
 const servers = readdirSync(root).filter((name) => name.endsWith("-mcp"));
+const SHARED = {
+  "alter.ts": servers,
+  "hosted.ts": servers,
+  "media.ts": ["gmail-mcp", "linkedin-mcp", "x-mcp"],
+};
 
 let failed = false;
-for (const file of SHARED) {
-  const copies = servers.map((name) => ({
+for (const [file, owners] of Object.entries(SHARED)) {
+  const copies = owners.map((name) => ({
     name,
     text: readFileSync(join(root, name, "src", file), "utf8"),
   }));

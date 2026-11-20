@@ -9,10 +9,16 @@ LinkedIn's official API lets a member app read the member's profile and publish 
 | Tool | What it does | With the recommended policy |
 |---|---|---|
 | `get_profile` | The connected member's name, email and member URN | Allowed |
-| `create_post` | Publishes a text post (public or connections only), up to 3,000 characters, optionally with an article link card (`link`: URL, title, description) | **Held until you approve it** |
+| `create_post` | Publishes a post (public or connections only), up to 3,000 characters, with one of: an article link card (`link`: URL, title, description), 1 to 20 images (`images`), or a video (`video`) | **Held until you approve it** |
 | `comment_on_post` | Comments on a post as the member, up to 1,250 characters | **Held until you approve it** |
 | `react_to_post` | Likes, celebrates, supports and so on | **Held until you approve it** |
 | `check_approval` | Reports what happened to a held request | Allowed |
+
+## Images and video
+
+`create_post` takes `images` (1 to 20, JPEG, PNG or GIF, up to 8 MB each, each with optional `alt_text`; two or more make a multi-image post) or `video` (one MP4, 75 KB to 500 MB, 3 seconds to 30 minutes, with an optional `title`). Each file is an `https` URL anyone can open, or, when the server runs on your computer (`npx`), an absolute file path. A hosted server takes URLs only, and a local one refuses URLs that point at private network addresses. A file you drop into a chat cannot be passed to a remote MCP server, so put it at a URL first.
+
+Images are uploaded through Alter, which adds the member's token LinkedIn requires for them. A video is started and finished through Alter, and its pieces go straight to LinkedIn's upload addresses, which LinkedIn requires to carry no token. The post is what waits for approval: the approver sees it and, in the agent's reason, each file's name, type, size and source.
 
 ## How a post works
 
@@ -43,10 +49,10 @@ alter agents create --app <app-id> --name linkedin-agent \
 alter connect create --provider linkedin --user-token "$USER_JWT" --agent linkedin-agent --output json
 ```
 
-**5. Policies.** Hold posts, comments and reactions for approval for up to 24 hours, and block deletes. With no `approvers` listed, you (who connected the account) approve:
+**5. Policies.** Hold posts, comments and reactions for approval for up to 24 hours, and block deletes. Alter classifies posts and comments as `send`, and reactions and media uploads as `write`; an upload is not visible until the post carrying it is published, so the rule holds posts and comments and names the reaction operation rather than holding every `write`. With no `approvers` listed, you (who connected the account) approve:
 
 ```bash
-echo '{"effect": "require_approval", "when": {"match": {"families": ["send", "write"]}}, "approval": {"channels": ["email"], "expires_in_seconds": 86400}}' | \
+echo '{"effect": "require_approval", "when": {"match": {"families": ["send"], "operations": ["reactions/create"]}}, "approval": {"channels": ["email"], "expires_in_seconds": 86400}}' | \
   alter policy rules create --app <app-id> --agent <agent-id> --type require_approval --body - --name "Approve every post"
 
 echo '{"when": {"family": ["delete"]}, "effect": "deny"}' | \

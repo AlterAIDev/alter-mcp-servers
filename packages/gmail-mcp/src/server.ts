@@ -9,8 +9,11 @@ import {
   describePending,
 } from "./alter.js";
 import {
+  type Attachment,
   GMAIL,
   type GmailMessage,
+  MAX_ATTACHMENT_BYTES,
+  MAX_ATTACHMENTS,
   attachmentNames,
   buildRawMessage,
   extractText,
@@ -18,6 +21,7 @@ import {
   headerValue,
   truncate,
 } from "./gmail.js";
+import { type Media, MediaError, type MediaOptions, formatBytes, openMedia, reasonWithMedia } from "./media.js";
 import { VERSION } from "./version.js";
 
 export const SERVER_NAME = "@alter-ai/gmail-mcp";
@@ -73,6 +77,17 @@ const compose = {
   reply_to_message_id: messageId
     .optional()
     .describe("Reply in the thread of this message (sets In-Reply-To and References)."),
+  attachments: z
+    .array(z.string().min(1).max(2048))
+    .max(MAX_ATTACHMENTS)
+    .optional()
+    .describe(
+      `Files to attach (images, video, PDFs, anything): each an https URL anyone can open, or, when the server runs on this computer, an absolute file path. Up to ${MAX_ATTACHMENTS} files and ${formatBytes(MAX_ATTACHMENT_BYTES)} in total.`,
+    ),
+  include_signature: z
+    .boolean()
+    .default(true)
+    .describe("Add the Gmail signature of the account's primary address below the body, as Gmail does."),
 };
 
 type Compose = {
@@ -82,14 +97,27 @@ type Compose = {
   subject: string;
   body: string;
   reply_to_message_id?: string | undefined;
+  attachments?: string[] | undefined;
+  include_signature: boolean;
 };
+
+interface Prepared {
+  raw: string;
+  threadId?: string;
+  media: Media[];
+  /** What happened to the signature: added, none set in Gmail, or left out by request. */
+  signature: "added" | "none" | "skipped";
+}
 
 export interface ServerOptions {
   log?: (message: string, error: unknown) => void;
+  /** Where attachments may come from. Defaults to public https URLs only. */
+  media?: MediaOptions;
 }
 
 export function createGmailServer(caller: AlterCaller, options: ServerOptions = {}): McpServer {
   const log = options.log ?? ((message, error) => console.error(`[${SERVER_NAME}] ${message}`, error));
+  const mediaOptions: MediaOptions = options.media ?? { allowFiles: false };
   const server = new McpServer({ name: SERVER_NAME, version: VERSION });
 
   const run = async (tool: string, action: () => Promise<ToolResult>): Promise<ToolResult> => {
@@ -97,7 +125,7 @@ export function createGmailServer(caller: AlterCaller, options: ServerOptions = 
       return await action();
     } catch (error) {
       if (error instanceof Held) return ok(describePending(error.outcome, tool));
-      if (error instanceof ProviderFailure) return fail(error.message);
+      if (error instanceof ProviderFailure || error instanceof MediaError) return fail(error.message);
       log(`${tool} failed`, error);
       return fail(describeError(error, PROVIDER));
     }
@@ -116,7 +144,58 @@ export function createGmailServer(caller: AlterCaller, options: ServerOptions = 
     );
   }
 
-  async function prepare(input: Compose, tool: string): Promise<{ raw: string; threadId?: string }> {
+  interface SendAs {
+    sendAsEmail?: string;
+    isPrimary?: boolean;
+    signature?: string;
+  }
+  let signature: Promise<string> | undefined;
+  /** The primary address's signature (HTML), read once per server. */
+  const primarySignature = (tool: string): Promise<string> => {
+    signature ??= (async () => {
+      let list: { sendAs?: SendAs[] };
+      try {
+        list = body<{ sendAs?: SendAs[] }>(
+          await caller.proxy({ method: "GET", url: `${GMAIL}/settings/sendAs`, tool }),
+          "read your send-as settings",
+        );
+      } catch (error) {
+        const why = error instanceof Error ? error.message : String(error);
+        throw new ProviderFailure(
+          `Could not read the Gmail signature, so nothing was sent or saved (${why}). Set include_signature to false to go ahead without it.`,
+        );
+      }
+      const primary = list.sendAs?.find((entry) => entry.isPrimary) ?? list.sendAs?.[0];
+      return primary?.signature ?? "";
+    })().catch((error: unknown) => {
+      signature = undefined;
+      throw error;
+    });
+    return signature;
+  };
+
+  async function readAttachments(sources: string[]): Promise<{ attachments: Attachment[]; media: Media[] }> {
+    const attachments: Attachment[] = [];
+    const media: Media[] = [];
+    let budget = MAX_ATTACHMENT_BYTES;
+    try {
+      for (const source of sources) {
+        if (budget <= 0) {
+          throw new MediaError(`The attachments are over ${formatBytes(MAX_ATTACHMENT_BYTES)} in total; ${source} does not fit.`);
+        }
+        const item = await openMedia(source, budget, mediaOptions);
+        media.push(item);
+        const data = await item.read(item.size);
+        budget -= item.size;
+        attachments.push({ filename: item.filename, contentType: item.contentType, data });
+      }
+      return { attachments, media };
+    } finally {
+      await Promise.all(media.map((item) => item.close()));
+    }
+  }
+
+  async function prepare(input: Compose, tool: string): Promise<Prepared> {
     let subject = input.subject;
     let inReplyTo: string | undefined;
     let references: string | undefined;
@@ -133,6 +212,8 @@ export function createGmailServer(caller: AlterCaller, options: ServerOptions = 
       if (!subject && originalSubject) subject = originalSubject;
       if (subject && !/^re:/i.test(subject)) subject = `Re: ${subject}`;
     }
+    const signatureHtml = input.include_signature ? (await primarySignature(tool)).trim() : "";
+    const { attachments, media } = await readAttachments(input.attachments ?? []);
     const raw = buildRawMessage({
       to: input.to,
       ...(input.cc ? { cc: input.cc } : {}),
@@ -141,9 +222,24 @@ export function createGmailServer(caller: AlterCaller, options: ServerOptions = 
       body: input.body,
       ...(inReplyTo ? { inReplyTo } : {}),
       ...(references ? { references } : {}),
+      ...(signatureHtml ? { signatureHtml } : {}),
+      ...(attachments.length > 0 ? { attachments } : {}),
     });
-    return { raw, ...(threadId ? { threadId } : {}) };
+    return {
+      raw,
+      ...(threadId ? { threadId } : {}),
+      media,
+      signature: !input.include_signature ? "skipped" : signatureHtml ? "added" : "none",
+    };
   }
+
+  const extras = (prepared: Prepared): string => {
+    const notes: string[] = [];
+    if (prepared.media.length > 0) notes.push(`${prepared.media.length} attachment(s): ${prepared.media.map((item) => item.filename).join(", ")}`);
+    if (prepared.signature === "added") notes.push("your Gmail signature added");
+    if (prepared.signature === "none") notes.push("no signature: none is set for the primary address in Gmail");
+    return notes.length > 0 ? ` With ${notes.join("; ")}.` : "";
+  };
 
   server.registerTool(
     "search_emails",
@@ -223,13 +319,14 @@ export function createGmailServer(caller: AlterCaller, options: ServerOptions = 
     {
       title: "Create a Gmail draft",
       description:
-        "Write a plain-text email as a draft in the mailbox. Nothing is sent: a person reviews it in Gmail and presses Send. Pass reply_to_message_id to reply in an existing thread.",
+        "Write an email as a draft in the mailbox, with the account's Gmail signature and any attachments. Nothing is sent: a person reviews it in Gmail and presses Send. Pass reply_to_message_id to reply in an existing thread.",
       inputSchema: compose,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
     (input) =>
       run("create_draft", async () => {
-        const { raw, threadId } = await prepare(input, "gmail.create_draft");
+        const prepared = await prepare(input, "gmail.create_draft");
+        const { raw, threadId } = prepared;
         const draft = body<{ id?: string; message?: { id?: string } }>(
           await caller.proxy({
             method: "POST",
@@ -240,7 +337,7 @@ export function createGmailServer(caller: AlterCaller, options: ServerOptions = 
           "create the draft",
         );
         return ok(
-          `Draft created (draft id ${draft.id ?? "unknown"}) for ${input.to.join(", ")}. It is in Gmail's Drafts folder; nothing has been sent.`,
+          `Draft created (draft id ${draft.id ?? "unknown"}) for ${input.to.join(", ")}.${extras(prepared)} It is in Gmail's Drafts folder; nothing has been sent.`,
         );
       }),
   );
@@ -250,7 +347,7 @@ export function createGmailServer(caller: AlterCaller, options: ServerOptions = 
     {
       title: "Send an email",
       description:
-        "Send a plain-text email. If the agent's policy holds sends for approval (the recommended setup), this returns an approval link and nothing is sent until a person approves exactly this email in the Alter Wallet. The approver sees the recipients, sender and subject; write the reason so they can decide.",
+        "Send an email with the account's Gmail signature and any attachments. If the agent's policy holds sends for approval (the recommended setup), this returns an approval link and nothing is sent until a person approves exactly this email in the Alter Wallet. The approver sees the recipients, sender, subject and the attachments' names and sources; write the reason so they can decide.",
       inputSchema: {
         ...compose,
         reason: headerSafe(500).optional().describe("Why this email is being sent. Shown to the approver."),
@@ -259,18 +356,20 @@ export function createGmailServer(caller: AlterCaller, options: ServerOptions = 
     },
     (input) =>
       run(`send email to ${input.to.join(", ")} ("${input.subject}")`, async () => {
-        const { raw, threadId } = await prepare(input, "gmail.send_email");
+        const prepared = await prepare(input, "gmail.send_email");
+        const { raw, threadId } = prepared;
+        const reason = reasonWithMedia(input.reason, prepared.media);
         const sent = body<{ id?: string }>(
           await caller.proxy({
             method: "POST",
             url: `${GMAIL}/messages/send`,
             json: { raw, ...(threadId ? { threadId } : {}) },
-            ...(input.reason ? { reason: input.reason } : {}),
+            ...(reason ? { reason } : {}),
             tool: "gmail.send_email",
           }),
           "send the email",
         );
-        return ok(`Sent to ${input.to.join(", ")} (message id ${sent.id ?? "unknown"}).`);
+        return ok(`Sent to ${input.to.join(", ")} (message id ${sent.id ?? "unknown"}).${extras(prepared)}`);
       }),
   );
 

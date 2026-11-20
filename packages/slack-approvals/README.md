@@ -10,7 +10,7 @@ The message is built from Alter's approver summary, which Alter reads from the h
 
 - the tool or operation, the agent, the provider and when the request expires;
 - the agent's stated reason;
-- the content: an email's recipients, subject and text; a LinkedIn post as readers will see it, with its link card; a comment or reaction; or the request body for other operations;
+- the content: an email's recipients, subject, text and attachments (name, type and size); a LinkedIn post as readers will see it, with its link card or its images and video; an X post with the post it replies to and its media; a comment or reaction; or the request body for other operations;
 - recipients outside the rule's allowed list, when the rule has one.
 
 **Approve** asks for confirmation, then Alter runs exactly the held request, once. **Deny** discards it.

@@ -64,3 +64,58 @@ export function errorDetail(body: string): string {
     return "";
   }
 }
+
+// Media: X's v2 chunked upload (initialize, append, finalize, status).
+// https://docs.x.com/x-api/media/quickstart/media-upload-chunked
+
+/** A post carries up to 4 images, or 1 GIF, or 1 video, never a mix. */
+export const MAX_IMAGES = 4;
+export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+export const MAX_GIF_BYTES = 15 * 1024 * 1024;
+/** X takes far larger videos; this keeps an upload inside one tool call. */
+export const MAX_VIDEO_BYTES = 512 * 1024 * 1024;
+/** X recommends segments of 5 MB or less; Alter accepts requests up to 10 MB. */
+export const UPLOAD_SEGMENT_BYTES = 4 * 1024 * 1024;
+/** How long to wait for X to finish processing a video before giving up. */
+export const PROCESSING_TIMEOUT_MS = 180_000;
+
+export type MediaCategory = "tweet_image" | "tweet_gif" | "tweet_video";
+
+export function mediaCategory(contentType: string): MediaCategory | undefined {
+  if (contentType === "image/gif") return "tweet_gif";
+  if (contentType === "image/png" || contentType === "image/jpeg" || contentType === "image/webp") return "tweet_image";
+  if (contentType === "video/mp4" || contentType === "video/quicktime") return "tweet_video";
+  return undefined;
+}
+
+export function maxBytesFor(category: MediaCategory): number {
+  return category === "tweet_image" ? MAX_IMAGE_BYTES : category === "tweet_gif" ? MAX_GIF_BYTES : MAX_VIDEO_BYTES;
+}
+
+/** A multipart/form-data body with text fields and one binary file field. */
+export function multipartBody(
+  fields: Record<string, string>,
+  file: { name: string; data: Uint8Array },
+): { body: Uint8Array; contentType: string } {
+  const random = crypto.getRandomValues(new Uint8Array(12));
+  const boundary = `alter${Array.from(random, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+  const encoder = new TextEncoder();
+  const head = Object.entries(fields)
+    .map(([name, value]) => `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`)
+    .join("");
+  const fileHead = `--${boundary}\r\nContent-Disposition: form-data; name="${file.name}"; filename="blob"\r\nContent-Type: application/octet-stream\r\n\r\n`;
+  const parts = [encoder.encode(head + fileHead), file.data, encoder.encode(`\r\n--${boundary}--\r\n`)];
+  const body = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    body.set(part, offset);
+    offset += part.length;
+  }
+  return { body, contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+export interface ProcessingInfo {
+  state?: "pending" | "in_progress" | "succeeded" | "failed";
+  check_after_secs?: number;
+  error?: { message?: string };
+}
