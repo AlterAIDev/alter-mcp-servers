@@ -118,3 +118,151 @@ export function errorDetail(body: string): string {
 export function truncate(text: string, max: number): { text: string; cut: boolean } {
   return text.length > max ? { text: text.slice(0, max), cut: true } : { text, cut: false };
 }
+
+// Writing values: plain values the agent gives, converted to Notion's
+// per-type property formats using the page's or database's own schema.
+
+/** A value for one property: text, a number, true/false, a list of names, or null to clear. */
+export type PlainValue = string | number | boolean | string[] | null;
+
+/** Column types `create_database` and `add_database_columns` can create. */
+export const COLUMN_TYPES = [
+  "text",
+  "number",
+  "select",
+  "multi_select",
+  "status",
+  "date",
+  "checkbox",
+  "url",
+  "email",
+  "phone",
+  "people",
+] as const;
+export type ColumnType = (typeof COLUMN_TYPES)[number];
+
+export interface ColumnSpec {
+  name: string;
+  type: ColumnType;
+  /** Choices for select, multi_select and status. */
+  options?: string[];
+}
+
+const richText = (text: string) => [{ text: { content: text } }];
+
+export class PropertyValueError extends Error {}
+
+/**
+ * The Notion request value for a property of `type`, from a plain value.
+ * Dates are "YYYY-MM-DD" (or an ISO time), and a range is two dates in a list.
+ */
+export function propertyValue(name: string, type: string | undefined, value: PlainValue): unknown {
+  const fail = (expected: string): never => {
+    throw new PropertyValueError(`"${name}" is a ${type ?? "unknown"} property; give ${expected}.`);
+  };
+  const text = (v: PlainValue) => (typeof v === "string" ? v : typeof v === "number" ? String(v) : fail("text"));
+  switch (type) {
+    case "title":
+      return { title: value === null ? [] : richText(text(value)) };
+    case "rich_text":
+      return { rich_text: value === null ? [] : richText(text(value)) };
+    case "number":
+      if (value === null) return { number: null };
+      if (typeof value === "number") return { number: value };
+      if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return { number: Number(value) };
+      return fail("a number");
+    case "checkbox":
+      if (typeof value === "boolean") return { checkbox: value };
+      if (value === "true" || value === "false") return { checkbox: value === "true" };
+      return fail("true or false");
+    case "select":
+      return { select: value === null ? null : { name: text(value) } };
+    case "status":
+      return { status: value === null ? null : { name: text(value) } };
+    case "multi_select": {
+      if (value === null) return { multi_select: [] };
+      const names = Array.isArray(value) ? value : typeof value === "string" ? value.split(",").map((part) => part.trim()).filter(Boolean) : fail("a list of names");
+      return { multi_select: names.map((option) => ({ name: option })) };
+    }
+    case "date": {
+      if (value === null) return { date: null };
+      const [start, end] = Array.isArray(value) ? value : [text(value)];
+      if (!start || Number.isNaN(Date.parse(start)) || (end !== undefined && Number.isNaN(Date.parse(end)))) {
+        return fail('a date like "2026-11-21", or a list of two dates for a range');
+      }
+      return { date: { start, ...(end ? { end } : {}) } };
+    }
+    case "url":
+      return { url: value === null ? null : text(value) };
+    case "email":
+      return { email: value === null ? null : text(value) };
+    case "phone_number":
+      return { phone_number: value === null ? null : text(value) };
+    case "relation": {
+      if (value === null) return { relation: [] };
+      const ids = Array.isArray(value) ? value : [text(value)];
+      if (!ids.every((id) => NOTION_ID.test(id))) return fail("Notion page ids");
+      return { relation: ids.map((id) => ({ id })) };
+    }
+    case "people": {
+      if (value === null) return { people: [] };
+      const ids = Array.isArray(value) ? value : [text(value)];
+      if (!ids.every((id) => NOTION_ID.test(id))) return fail("Notion user ids (people are set by id)");
+      return { people: ids.map((id) => ({ id })) };
+    }
+    default:
+      return fail("nothing: it is computed by Notion or not supported here, so set it in Notion");
+  }
+}
+
+/** Builds a `properties` object from plain values, using `schema` (name to property type). */
+export function propertiesFrom(values: Record<string, PlainValue>, schema: Record<string, string>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(values)) {
+    const type = schema[name];
+    if (!type) {
+      const known = Object.keys(schema).sort().join(", ");
+      throw new PropertyValueError(`There is no property "${name}" here. Properties: ${known || "none"}.`);
+    }
+    out[name] = propertyValue(name, type, value);
+  }
+  return out;
+}
+
+/** The property-type map of a page or data source object (`properties` keyed by name, each with a `type`). */
+export function schemaOf(object: { properties?: Record<string, { type?: string }> }): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(object.properties ?? {}).flatMap(([name, property]) => (property.type ? [[name, property.type]] : [])),
+  );
+}
+
+const COLOURS = ["default", "gray", "brown", "orange", "yellow", "green", "blue", "purple", "pink", "red"] as const;
+
+/** The Notion property configuration for a column spec. */
+export function columnConfig(column: ColumnSpec): unknown {
+  const options = (column.options ?? []).map((name, index) => ({ name, color: COLOURS[(index + 1) % COLOURS.length] }));
+  switch (column.type) {
+    case "text":
+      return { rich_text: {} };
+    case "number":
+      return { number: { format: "number" } };
+    case "select":
+      return { select: { options } };
+    case "multi_select":
+      return { multi_select: { options } };
+    case "status":
+      return { status: options.length > 0 ? { options } : {} };
+    case "date":
+      return { date: {} };
+    case "checkbox":
+      return { checkbox: {} };
+    case "url":
+      return { url: {} };
+    case "email":
+      return { email: {} };
+    case "phone":
+      return { phone_number: {} };
+    case "people":
+      return { people: {} };
+  }
+}
