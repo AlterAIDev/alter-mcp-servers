@@ -1,6 +1,6 @@
 # Notion MCP server with policy and approvals (`@alter-ai/notion-mcp`)
 
-A Notion MCP server for AI agents that searches, reads pages as Markdown, queries databases, creates and adds to pages, and comments, where the server never holds a Notion token. It is backed by [Alter](https://alterauth.com): Alter stores the Notion credential, adds it to each request, enforces the policies you set on the agent, and records every call.
+A Notion MCP server for AI agents that searches, reads pages as Markdown, queries databases, creates, edits, organizes and trashes pages and databases, and comments, where the server never holds a Notion token. It is backed by [Alter](https://alterauth.com): Alter stores the Notion credential, adds it to each request, enforces the policies you set on the agent, and records every call.
 
 ## Tools
 
@@ -9,12 +9,19 @@ A Notion MCP server for AI agents that searches, reads pages as Markdown, querie
 | `search` | Finds pages and databases shared with the connection, by title | Allowed |
 | `read_page` | A page's content as Markdown (long pages are cut) | Allowed |
 | `query_database` | Rows of a database with their filled properties; takes Notion's `filter` and `sorts` | Allowed |
-| `create_page` | A page under another page, or a row in a database, with optional Markdown content | Allowed, or held if you hold sends (see Policies) |
-| `append_to_page` | Adds Markdown to the end of a page, silently; nothing on the page is changed or removed | Allowed |
+| `create_page` | A page under another page, or a row in a database with values for its columns, with optional Markdown content | Allowed, or held if you hold sends (see Policies) |
+| `append_to_page` | Adds Markdown to the end of a page, silently; nothing on the page is changed or removed | Allowed, or held if you hold sends |
+| `update_page` | Changes a page's title or a row's properties (status, select, dates, numbers, text) from plain values, silently | Allowed |
+| `edit_page` | Replaces a page's content with new Markdown, or finds and replaces text in it; child pages are kept unless `allow_removing_child_pages` is set | Allowed; **held** when it may remove child pages |
+| `create_database` | A database (a table of pages, such as a hypothesis tracker) under a page, with typed columns | Allowed |
+| `add_database_columns` | Adds typed columns to a database | Allowed |
+| `move_page` | Moves a page under another page or into a database | **Held**: moving can change who has access |
+| `trash_page` | Moves a page or a whole database to Notion's trash | **Held until you approve it** |
+| `restore_page` | Brings a trashed page or database back | Allowed |
 | `add_comment` | Comments on a page | Allowed, or held if you hold sends |
 | `check_approval` | Reports what happened to a held request | Allowed |
 
-Deleting is not a tool, and the recommended policy also blocks Notion's delete operations (trashing pages and blocks, erasing content) for the agent.
+Alter judges each request by what it does, not by the tool: an edit that may remove child pages, trashing, and erasing content are deletes; a move is an admin action because the page takes its new parent's sharing; a write that notifies people, or adds Markdown that can mention them, is a send.
 
 ## What the agent can reach
 
@@ -41,14 +48,16 @@ alter agents create --app <app-id> --name notion-agent \
 alter connect create --provider notion --user-token "$USER_JWT" --agent notion-agent --output json
 ```
 
-**5. Policies.** Block deletes:
+**5. Policies.** Hold deletes and moves for your approval. A trashed page can be restored, but you should see each one first:
 
 ```bash
-echo '{"when": {"family": ["delete"]}, "effect": "deny"}' | \
-  alter policy rules create --app <app-id> --agent <agent-id> --body - --name "No deletes"
+echo '{"effect": "require_approval", "when": {"match": {"families": ["delete", "admin"]}}, "approval": {"approvers": ["you@example.com"], "channels": ["email"], "expires_in_seconds": 86400}}' | \
+  alter policy rules create --app <app-id> --agent <agent-id> --type require_approval --body - --name "Approve deletes and moves"
 ```
 
-Notion treats creating a page and commenting as operations that can notify people, so Alter classifies them as `send`. To review each one before it happens, also hold sends; every new page and comment then waits for approval, while reads and `append_to_page` do not:
+To forbid deletes outright instead, use a deny rule: `{"when": {"family": ["delete"]}, "effect": "deny"}`.
+
+Notion treats creating a page, adding Markdown and commenting as operations that can notify people, so Alter classifies them as `send`. To review each one before it happens, also hold sends; every new page, appended text and comment then waits for approval, while reads, `update_page` and `edit_page` do not:
 
 ```bash
 echo '{"effect": "require_approval", "when": {"match": {"families": ["send"]}}, "approval": {"approvers": ["you@example.com"], "channels": ["email"], "expires_in_seconds": 86400}}' | \
@@ -78,6 +87,14 @@ Other clients (`mcpServers` in the client's config file):
 ```
 
 Until the first npm release, build from source (`pnpm install && pnpm build` at the repository root) and use `node packages/notion-mcp/dist/index.js` as the command.
+
+## Example: a GTM hypothesis tracker
+
+Ask your agent to set it up, or have it call:
+
+1. `create_database` under a page you shared, titled "GTM hypotheses", with `title_column` "Hypothesis" and columns: `Type` (select: GTM, Customer, Sales, ICP), `Segment` (multi_select), `Status` (status: Untested, Testing, Validated, Invalidated), `Metric` (text), `Target` (text), `Result` (text), `Confidence` (select: Low, Medium, High), `Start` and `End` (date).
+2. `create_page` with the returned data source id for each hypothesis, with its `properties`, and the reasoning and test plan as Markdown.
+3. As evidence comes in: `update_page` for status and result, `append_to_page` or `edit_page` for the write-up, `query_database` with a filter such as `{"property": "Status", "status": {"equals": "Testing"}}` to review what is open, and `trash_page` for hypotheses you drop (held for your approval).
 
 ## Host on Cloudflare (remote, multi-user MCP)
 
