@@ -90,7 +90,7 @@ Run the server as a Cloudflare Worker so claude.ai, Claude Code and other client
 What happens when someone connects a client:
 
 1. The client registers itself and opens the Worker's consent page, which names the client and where its access will go.
-2. They choose **Allow and sign in**. A window opens with your app's sign-in page, through Alter.
+2. They choose **Allow and sign in**. A window opens with your app's sign-in page, through Alter. When they have signed in, Alter sends that window back to the Worker with a one-time code, and the Worker accepts it only in the browser that started the sign-in.
 3. The Worker checks they are on `ALLOWED_USERS`, then asks Alter, with their identity-provider token, for their own LinkedIn connection delegated to this server's agent. If they have none yet, the page offers **Connect LinkedIn**: they connect it once through Alter Connect, delegated to the agent.
 4. The client gets a token for this server bound to that one connection. Every tool call uses it, so nobody can reach another person's LinkedIn. Tokens are stored hashed in Workers KV.
 
@@ -116,7 +116,15 @@ npx wrangler secret put ALLOWED_USERS
 
 `ALLOWED_USERS` is a comma-separated list of identity-provider user ids, emails, whole email domains (`@example.com`), or `*` for anyone your identity provider signs in. Prefer user ids, or a domain your provider verifies, when people can sign up with an email they have not verified. The optional `LINKEDIN_API_VERSION` under [Configuration](#configuration) is also a Worker secret; `ALTER_ACCOUNT` and `ALTER_GRANT_ID` do not apply, since each person's connection is chosen at sign-in.
 
-**3. Connect a client** to `https://alter-linkedin-mcp.<your-subdomain>.workers.dev/mcp` and sign in when asked:
+**3. Register the Worker's sign-in return URL** on the Alter app. In the Alter dashboard, open the app's sign-in settings and add this exact address to its return URLs (the Worker's address followed by `/authorize/return`; use your own domain instead if the Worker is served from one):
+
+```
+https://alter-linkedin-mcp.<your-subdomain>.workers.dev/authorize/return
+```
+
+Until it is registered, Alter refuses to start a sign-in and the page says so.
+
+**4. Connect a client** to `https://alter-linkedin-mcp.<your-subdomain>.workers.dev/mcp` and sign in when asked:
 
 - claude.ai and Claude Desktop: **Settings**, **Connectors**, **Add custom connector**.
 - Claude Code: `claude mcp add --transport http linkedin https://alter-linkedin-mcp.<your-subdomain>.workers.dev/mcp`, then `/mcp` to sign in.
@@ -124,7 +132,7 @@ npx wrangler secret put ALLOWED_USERS
 
 If someone reconnects their LinkedIn in Alter later, their client's next call is refused until they sign in again, which picks up the new connection.
 
-Start sign-ins only from your MCP client, and never complete a sign-in link someone sends you: Alter's sign-in is link-based, so whoever started the sign-in gets the access.
+A sign-in finishes only in the browser that started it: the Worker redeems Alter's one-time code only for the browser holding the cookie it set with the sign-in page, so a sign-in link sent to someone else gives the sender nothing. Still start sign-ins only from your MCP client, and never complete a sign-in or connect link someone sends you.
 
 To approve held requests from Slack instead of the Wallet, add [`slack-approvals`](../slack-approvals).
 

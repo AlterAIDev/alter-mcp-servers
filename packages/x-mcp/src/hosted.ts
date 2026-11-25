@@ -8,11 +8,21 @@
 // Okta, ...) runs the login, so the Worker holds no identity-provider secret.
 //
 //   client ──/authorize──▶ consent page ──Allow──▶ Alter sign-in (popup)
-//          ◀──code──────── the page polls until the sign-in completes; the
+//                          the popup comes back to /authorize/return with a
+//                          one-time code, which the Worker redeems only for
+//                          the browser that started the sign-in
+//          ◀──code──────── the page polls until that has happened; the
 //                          Worker checks ALLOWED_USERS, asks Alter for THIS
 //                          person's own connection delegated to the agent
 //                          (offering to connect one if there is none), and
 //                          issues the client a token bound to that connection
+//
+// The sign-in is bound to the browser that started it. Alter sends the
+// one-time code to this Worker's own return address, in the browser that
+// signed in, and the Worker redeems it only when that browser also holds the
+// cookie set with the sign-in page. A sign-in link forwarded to someone else
+// therefore gives the sender nothing: the other person's browser has no
+// cookie, and the sender's browser never receives the code.
 //
 // Every tool call then runs through the signed-in person's own connection,
 // under the policies set in Alter on the agent and on that person, and is
@@ -40,9 +50,18 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 export const MCP_PATH = "/mcp";
 const AUTHORIZE_PATH = "/authorize";
 const WAIT_PATH = "/authorize/wait";
+/**
+ * Where Alter sends the browser after the identity provider's login. The full
+ * URL (the Worker's origin plus this path) must be registered on the Alter app
+ * as a sign-in return URL.
+ */
+export const RETURN_PATH = "/authorize/return";
+/** The per-sign-in cookie that proves which browser started it; the sign-in's id is appended. */
+const BINDING_COOKIE = "__Host-alter-signin";
 /** How long one poll waits before answering "still pending". */
 const POLL_WINDOW_MS = 20_000;
 const CONNECT_CHECK_INTERVAL_MS = 2_500;
+const SIGNIN_CHECK_INTERVAL_MS = 1_500;
 /** How long a person has to finish signing in and connecting. */
 const PENDING_TTL_SECONDS = 900;
 
@@ -78,16 +97,25 @@ export interface SignedInUser {
   name?: string;
 }
 
-export type PollResult =
-  | { status: "pending" }
+export type RedeemResult =
   | { status: "completed"; user: SignedInUser; userToken: string }
   | { status: "failed"; message: string };
 
-/** Alter's link-based sign-in: start a session, then poll it. */
+/**
+ * Alter's redirect sign-in: start a session, send the browser to `authUrl`,
+ * and redeem the one-time code Alter returns to `returnUrl`. The caller must
+ * redeem only for the browser that started the sign-in.
+ */
 export interface SignIn {
-  start(): Promise<{ authUrl: string; sessionToken: string; expiresIn: number }>;
-  poll(sessionToken: string): Promise<PollResult>;
+  /** Throws SignInStartError, with a message fit to show, when no bound sign-in can be started. */
+  start(options: { returnUrl: string; state: string }): Promise<{ authUrl: string; sessionToken: string; expiresIn: number }>;
+  redeem(sessionToken: string, code: string): Promise<RedeemResult>;
   close(): Promise<void>;
+}
+
+/** A sign-in could not be started; `message` is shown to the person. */
+export class SignInStartError extends Error {
+  override name = "SignInStartError";
 }
 
 /** The signed-in person's own connection to the provider, delegated to this server's agent. */
@@ -106,16 +134,45 @@ export interface HostedDeps {
   pollWindowMs?: number;
 }
 
+/**
+ * The redirect sign-in calls of the Alter SDK, typed here because the SDK
+ * release that declares them is not published yet. Once it is, delete this
+ * interface and the cast in alterSignIn, and call `app` directly.
+ */
+interface RedirectSignInApp {
+  createAuthSession(options: {
+    mode: "redirect";
+    returnUrl: string;
+    state: string;
+  }): Promise<{ authUrl: string; sessionToken: string; expiresIn: number; mode?: string }>;
+  redeemAuthSession(sessionToken: string, code: string): Promise<{ userToken: string; userInfo: Record<string, unknown> }>;
+}
+
 export function alterSignIn(apiKey: string): SignIn {
   const app = new App({ apiKey });
+  const redirect = app as unknown as RedirectSignInApp;
   return {
-    async start() {
-      const session = await app.createAuthSession();
+    async start({ returnUrl, state }) {
+      let session: Awaited<ReturnType<RedirectSignInApp["createAuthSession"]>>;
+      try {
+        session = await redirect.createAuthSession({ mode: "redirect", returnUrl, state });
+      } catch (error) {
+        // Alter refuses a return URL that is not registered on the app (signin_return_url_not_allowed).
+        if (error instanceof Error && /signin_return_url_not_allowed/.test(`${error.message} ${JSON.stringify((error as { details?: unknown }).details ?? "")}`)) {
+          throw new SignInStartError(`This server is not set up for sign-in yet: its operator must add ${returnUrl} to the Alter app's sign-in return URLs.`);
+        }
+        throw new SignInStartError("The sign-in could not be started. Try again from your MCP client.");
+      }
+      // Anything but a redirect session could be finished by whoever holds its link, so refuse it.
+      // An SDK older than the redirect sign-in ignores the options above and lands here.
+      if (session.mode !== "redirect") {
+        throw new SignInStartError("This server cannot start a sign-in bound to this browser. Its operator must update it.");
+      }
       return { authUrl: session.authUrl, sessionToken: session.sessionToken, expiresIn: session.expiresIn };
     },
-    async poll(sessionToken) {
+    async redeem(sessionToken, code) {
       try {
-        const result = await app.pollAuthSession(sessionToken, { timeoutMs: POLL_WINDOW_MS, pollIntervalMs: 1500 });
+        const result = await redirect.redeemAuthSession(sessionToken, code);
         const info = result.userInfo;
         const sub = typeof info.sub === "string" ? info.sub : "";
         if (!sub) return { status: "failed", message: "The identity provider did not return a user id." };
@@ -128,13 +185,9 @@ export function alterSignIn(apiKey: string): SignIn {
             ...(typeof info.name === "string" ? { name: info.name } : {}),
           },
         };
-      } catch (error) {
-        const name = error instanceof Error ? error.name : "";
-        // The poll window ran out with the person still signing in.
-        if (name === "ConnectTimeoutError") return { status: "pending" };
-        // Alter answered 503 while syncing the identity: try again.
-        if (name === "BackendError" && (error as { statusCode?: number }).statusCode === 503) return { status: "pending" };
-        return { status: "failed", message: "The sign-in failed or expired. Start again from your MCP client." };
+      } catch {
+        // The code is single use and short-lived, and Alter burns it on the first attempt.
+        return { status: "failed", message: SIGNIN_FAILED };
       }
     },
     close: () => app.close(),
@@ -185,12 +238,19 @@ export function isAllowed(user: SignedInUser, allowed: Set<string>): boolean {
 }
 
 // ── The pending sign-in, between the Allow click and the last poll ──────────
-// Keyed and encrypted by the upstream `state`, which only this browser holds:
-// reading KV alone reveals neither Alter's session token nor the person's
-// identity-provider token.
+// Keyed and encrypted by the upstream `state`, which this browser holds and
+// Alter echoes back to the return address: reading KV alone reveals neither
+// Alter's session token nor the person's identity-provider token.
+
+const SIGNIN_FAILED = "The sign-in failed or expired. Start again from your MCP client.";
 
 type Pending =
-  | { stage: "signin"; sessionToken: string }
+  /** Waiting for the popup to come back; `bindingHash` is the SHA-256 of the starting browser's cookie value. */
+  | { stage: "signin"; sessionToken: string; bindingHash: string }
+  /** The return address redeemed the code for the starting browser. */
+  | { stage: "signedin"; userToken: string; user: SignedInUser }
+  /** The return address was told the sign-in failed, by the starting browser. */
+  | { stage: "failed"; message: string }
   | { stage: "connect"; userToken: string; user: SignedInUser; connectUrl: string };
 
 const encoder = new TextEncoder();
@@ -235,6 +295,41 @@ export async function deletePending(kv: KvLike, state: string): Promise<void> {
   await kv.delete(await pendingKey(state));
 }
 
+// ── The binding cookie: which browser started this sign-in ──────────────────
+// The OAuth library binds its upstream `state` to the browser with a cookie of
+// its own, but checks it only inside finishUpstream(), which also consumes the
+// state. The return address has to check the browser first and keep the state
+// for the last poll, so the Worker sets its own cookie beside the library's: a
+// random value only this browser receives, whose hash is kept in the pending
+// record. One cookie per sign-in, so two tabs do not replace each other's.
+
+async function bindingCookieName(state: string): Promise<string> {
+  return `${BINDING_COOKIE}-${hex(await sha256(`cookie:${state}`)).slice(0, 16)}`;
+}
+
+const bindingHash = async (value: string) => hex(await sha256(`binding:${value}`));
+
+function readCookie(request: Request, name: string): string | undefined {
+  for (const part of (request.headers.get("Cookie") ?? "").split(";")) {
+    const separator = part.indexOf("=");
+    if (separator !== -1 && part.slice(0, separator).trim() === name) return part.slice(separator + 1).trim();
+  }
+  return undefined;
+}
+
+function sameText(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let difference = 0;
+  for (let index = 0; index < a.length; index += 1) difference |= a.charCodeAt(index) ^ b.charCodeAt(index);
+  return difference === 0;
+}
+
+/** Whether this request comes from the browser that started the sign-in `state` names. */
+async function startedInThisBrowser(request: Request, state: string, expectedHash: string): Promise<boolean> {
+  const value = readCookie(request, await bindingCookieName(state));
+  return Boolean(value) && sameText(await bindingHash(value as string), expectedHash);
+}
+
 // ── Pages ───────────────────────────────────────────────────────────────────
 
 export interface HostedUi {
@@ -263,6 +358,8 @@ function html(body: string, status: number, headers: Headers, nonce?: string): R
     `default-src 'none'; style-src 'unsafe-inline'; ${nonce ? `script-src 'nonce-${nonce}'; connect-src 'self'; ` : ""}frame-ancestors 'none'; base-uri 'none'`,
   );
   headers.set("X-Frame-Options", "DENY");
+  // The return address carries a one-time code in its URL.
+  headers.set("Referrer-Policy", "no-referrer");
   return new Response(body, { status, headers });
 }
 
@@ -305,14 +402,19 @@ wait();`;
 <div id="connect" hidden><h2>Connect your ${name}</h2><p>One more step: connect your own ${name}. Alter stores the credential and this server never sees it; every request is checked against the policies set in Alter and recorded.</p>
 <p><button class="primary" id="connect-go">Connect ${name}</button></p></div>
 <p id="status" role="status"></p>
-<p class="note">Only sign in from this page. Never complete a sign-in link someone sent you: it would connect their app to your account.</p>`,
+<p class="note">Only sign in from this page. The sign-in finishes only in the browser that started it. Never complete a sign-in or connect link someone sent you.</p>`,
     nonce,
     script,
   );
 }
 
-function errorPage(message: string): Response {
-  return html(page("Cannot connect", `<h1>Cannot connect</h1><p>${escapeHtml(message)}</p>`), 400, new Headers());
+/** What the popup shows once it is back from the identity provider; it closes itself where the browser allows. */
+export function returnPage(heading: string, message: string, nonce: string): string {
+  return page(heading, `<h1>${escapeHtml(heading)}</h1><p>${escapeHtml(message)}</p>`, nonce, "window.close();");
+}
+
+function errorPage(message: string, status = 400, headers = new Headers()): Response {
+  return html(page("Cannot connect", `<h1>Cannot connect</h1><p>${escapeHtml(message)}</p>`), status, headers);
 }
 
 const json = (body: unknown, status: number, headers = new Headers()) => {
@@ -348,16 +450,30 @@ export async function handleAuthorize(request: Request, env: HostedEnv, ui: Host
         return new Response(null, { status: 302, headers: denied.headers });
       }
       const approved = await oauth.approveConsent(request, handle);
+      const upstream = await oauth.beginUpstream(approved.request, { headers: approved.headers });
       const signIn = deps.signIn(env);
       try {
-        const session = await signIn.start();
-        const upstream = await oauth.beginUpstream(approved.request, { headers: approved.headers });
-        await savePending(env.OAUTH_KV, upstream.state, { stage: "signin", sessionToken: session.sessionToken });
+        const session = await signIn.start({ returnUrl: `${url.origin}${RETURN_PATH}`, state: upstream.state });
+        // Only this response, so only this browser, ever carries the binding value; KV keeps its hash.
+        const binding = hex(crypto.getRandomValues(new Uint8Array(32)));
+        await savePending(env.OAUTH_KV, upstream.state, {
+          stage: "signin",
+          sessionToken: session.sessionToken,
+          bindingHash: await bindingHash(binding),
+        });
+        upstream.headers.append(
+          "Set-Cookie",
+          `${await bindingCookieName(upstream.state)}=${binding}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${PENDING_TTL_SECONDS}`,
+        );
         const nonce = hex(crypto.getRandomValues(new Uint8Array(16)));
         return html(signInPage(ui, upstream.state, session.authUrl, nonce), 200, upstream.headers, nonce);
       } finally {
         await signIn.close();
       }
+    }
+
+    if (url.pathname === RETURN_PATH && request.method === "GET") {
+      return await signInReturn(request, url, env, deps);
     }
 
     if (url.pathname === WAIT_PATH && request.method === "GET") {
@@ -372,8 +488,52 @@ export async function handleAuthorize(request: Request, env: HostedEnv, ui: Host
       return errorPage(error.description ?? error.message);
     }
     if (error instanceof Error && error.name === "CimdFetchError") return errorPage("This app could not be verified.");
+    if (error instanceof SignInStartError) return errorPage(error.message, 502);
     throw error;
   }
+}
+
+/**
+ * The popup, back from the identity provider with Alter's one-time `code` (or
+ * an `error`) and the `state` this Worker chose. Nothing is redeemed, and the
+ * pending sign-in is left untouched, unless this browser holds the binding
+ * cookie set with the sign-in page: a person who was sent someone else's
+ * sign-in link arrives here without it.
+ */
+async function signInReturn(request: Request, url: URL, env: HostedEnv, deps: HostedDeps): Promise<Response> {
+  const state = url.searchParams.get("state") ?? "";
+  const pending = state ? await loadPending(env.OAUTH_KV, state) : null;
+  if (!pending) return errorPage("This sign-in expired. Start again from your MCP client.", 410);
+  if (pending.stage !== "signin") return errorPage("This sign-in was already completed. Go back to the page where you started.", 409);
+  if (!(await startedInThisBrowser(request, state, pending.bindingHash))) {
+    return errorPage(
+      "This sign-in was not started in this browser, so it was not completed and nobody was given access. If someone sent you this link, do not try again. To connect your own app, start from your MCP client.",
+      403,
+    );
+  }
+
+  // From here on the request is the starting browser's. Its cookie has done its work.
+  const headers = new Headers({ "Set-Cookie": `${await bindingCookieName(state)}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0` });
+  const nonce = hex(crypto.getRandomValues(new Uint8Array(16)));
+  const failed = async (message: string): Promise<Response> => {
+    // A second request racing a successful one must not undo it.
+    if ((await loadPending(env.OAUTH_KV, state))?.stage === "signin") await savePending(env.OAUTH_KV, state, { stage: "failed", message });
+    return html(returnPage("Sign-in failed", "Close this window and start again from your MCP client.", nonce), 400, headers, nonce);
+  };
+
+  const code = url.searchParams.get("code") ?? "";
+  if (url.searchParams.get("error") || !code) return failed(SIGNIN_FAILED);
+
+  const signIn = deps.signIn(env);
+  let result: RedeemResult;
+  try {
+    result = await signIn.redeem(pending.sessionToken, code);
+  } finally {
+    await signIn.close();
+  }
+  if (result.status === "failed") return failed(result.message);
+  await savePending(env.OAUTH_KV, state, { stage: "signedin", userToken: result.userToken, user: result.user });
+  return html(returnPage("Signed in", "You can close this window and go back to the page where you started.", nonce), 200, headers, nonce);
 }
 
 async function poll(request: Request, state: string, env: HostedEnv, deps: HostedDeps): Promise<Response> {
@@ -396,44 +556,47 @@ async function poll(request: Request, state: string, env: HostedEnv, deps: Hoste
     return json({ error: message }, status, resumed.headers);
   };
 
+  const deadline = Date.now() + (deps.pollWindowMs ?? POLL_WINDOW_MS);
   const access = deps.access(env);
   try {
-    if (pending.stage === "signin") {
-      const signIn = deps.signIn(env);
-      let result: PollResult;
-      try {
-        result = await signIn.poll(pending.sessionToken);
-      } finally {
-        await signIn.close();
-      }
-      if (result.status === "pending") return json({ status: "pending" }, 202);
-      if (result.status === "failed") {
-        await deletePending(env.OAUTH_KV, state);
-        return json({ error: result.message }, 400);
-      }
-      if (!isAllowed(result.user, parseAllowedUsers(env.ALLOWED_USERS))) return refuse(403, "This account may not use this server.");
-      const found = await access.find(result.userToken);
-      if (found) return finish(result.user, found.grantId);
-      const connectUrl = await access.connect(result.userToken);
-      await savePending(env.OAUTH_KV, state, { stage: "connect", userToken: result.userToken, user: result.user, connectUrl });
+    // stage "signin": wait for the return address to store who signed in. Alter is
+    // never asked here: only the return address, in the starting browser, redeems.
+    let current: Pending = pending;
+    while (current.stage === "signin") {
+      if (Date.now() + SIGNIN_CHECK_INTERVAL_MS > deadline) return json({ status: "pending" }, 202);
+      await sleep(SIGNIN_CHECK_INTERVAL_MS);
+      const reloaded = await loadPending(env.OAUTH_KV, state);
+      if (!reloaded) return json({ error: "This sign-in expired. Start again from your MCP client." }, 410);
+      current = reloaded;
+    }
+    if (current.stage === "failed") {
+      await deletePending(env.OAUTH_KV, state);
+      return json({ error: current.message }, 400);
+    }
+    if (current.stage === "signedin") {
+      if (!isAllowed(current.user, parseAllowedUsers(env.ALLOWED_USERS))) return refuse(403, "This account may not use this server.");
+      const found = await access.find(current.userToken);
+      if (found) return finish(current.user, found.grantId);
+      const connectUrl = await access.connect(current.userToken);
+      await savePending(env.OAUTH_KV, state, { stage: "connect", userToken: current.userToken, user: current.user, connectUrl });
       return json({ status: "connect", connectUrl }, 202);
     }
+    const connecting = current;
 
     // stage "connect": wait for the person's new connection to appear.
-    const deadline = Date.now() + (deps.pollWindowMs ?? POLL_WINDOW_MS);
     for (;;) {
       let found: { grantId: string } | null;
       try {
-        found = await access.find(pending.userToken);
+        found = await access.find(connecting.userToken);
       } catch {
         // Typically the identity-provider token expired while connecting.
         return refuse(400, "The sign-in expired before the connection finished. Start again from your MCP client.");
       }
-      if (found) return finish(pending.user, found.grantId);
+      if (found) return finish(connecting.user, found.grantId);
       if (Date.now() + CONNECT_CHECK_INTERVAL_MS > deadline) break;
       await sleep(CONNECT_CHECK_INTERVAL_MS);
     }
-    return json({ status: "connect", connectUrl: pending.connectUrl }, 202);
+    return json({ status: "connect", connectUrl: connecting.connectUrl }, 202);
   } finally {
     await access.close();
   }

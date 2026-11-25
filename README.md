@@ -52,6 +52,10 @@ MCP client ──opens in your browser──▶ MCP server: consent page
                                               │ Allow and sign in
                                               ▼
                                       Alter sign-in ──▶ your identity provider's login page
+                                              │ a one-time code, to the same browser
+                                              ▼
+                                      MCP server: redeems it only for the browser that
+                                      started the sign-in (a cookie set with the sign-in page)
                                               │
                                       MCP server: checks ALLOWED_USERS, finds YOUR own
                                       connection through Alter (or offers to connect one)
@@ -76,7 +80,7 @@ The AI model never takes part in sign-in. It sees only the tools and what they r
 
 **After sign-in.** The client sends its access token with every tool call. The server checks it, acts through the one connection the token is bound to, and Alter applies your policies and records the call. Access tokens last an hour and the client refreshes them; you sign in again after 30 days, or after you reconnect your account in Alter.
 
-**One caution.** Alter's sign-in is link-based: whoever started a sign-in gets its result. Start sign-ins only from your MCP client, and never finish a sign-in link someone sends you.
+**Bound to your browser.** After the login, Alter sends your browser back to the server's own return address (`/authorize/return`) with a one-time code. The server redeems the code only when that browser holds the cookie it set with the sign-in page, so a sign-in link someone forwards cannot be finished for them: the other person's browser has no cookie, and the sender's browser never receives the code. The operator registers the return address on the Alter app once (see each package's "Host on Cloudflare"). Still start sign-ins only from your MCP client, and never finish a sign-in or connect link someone sends you.
 
 ## Development
 

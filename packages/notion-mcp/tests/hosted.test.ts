@@ -9,8 +9,9 @@ import {
   type Access,
   type HostedEnv,
   type KvLike,
-  type PollResult,
+  type RedeemResult,
   type SignIn,
+  SignInStartError,
   consentPage,
   handleAuthorize,
   hostedWorker,
@@ -33,6 +34,10 @@ const AUTH_REQUEST = {
   state: "client-state",
 };
 const ANA = { sub: "user_1", email: "ana@example.com" };
+const RETURN_URL = `${ORIGIN}/authorize/return`;
+/** The one-time code the fake Alter hands the browser that signed in as Ana. */
+const CODE = "one-time-code-ana";
+const BINDING_COOKIE = /^__Host-alter-signin-[0-9a-f]{16}$/;
 
 class AuthorizationError extends Error {
   override name = "AuthorizationError";
@@ -56,12 +61,21 @@ function memoryKv(): KvLike & { data: Map<string, string> } {
 }
 
 interface Options {
-  poll?: PollResult;
+  /** Who the fake Alter says signed in when CODE is redeemed. */
+  user?: { sub: string; email?: string };
   allowed?: string;
-  finishFails?: boolean;
+  startFails?: boolean;
   /** The connection Access.find returns for each call, in order (the last repeats). */
   found?: ({ grantId: string } | null | "throw")[];
+  /** Runs inside the first redeem, before it answers. */
+  duringRedeem?: () => Promise<void>;
 }
+
+const cookieOf = (request: Request, name: string) =>
+  (request.headers.get("cookie") ?? "")
+    .split(";")
+    .map((part) => part.trim().split("="))
+    .find(([key]) => key === name)?.[1];
 
 function setup(options: Options = {}) {
   const calls: { name: string; args: unknown[] }[] = [];
@@ -91,9 +105,10 @@ function setup(options: Options = {}) {
       opts.headers.append("Set-Cookie", "upstream=1; Secure; HttpOnly");
       return { state: STATE, headers: opts.headers };
     },
-    finishUpstream: async () => {
+    // Like the library: consumes the state, and only for the browser holding the cookie beginUpstream set.
+    finishUpstream: async (request: Request) => {
       calls.push({ name: "finishUpstream", args: [] });
-      if (options.finishFails) throw new AuthorizationError("This sign-in was opened in another browser.");
+      if (cookieOf(request, "upstream") !== "1") throw new AuthorizationError("This authorization was not started in this browser; start again");
       return { request: AUTH_REQUEST, data: undefined, headers: new Headers({ "Set-Cookie": "upstream=; Max-Age=0" }) };
     },
     completeAuthorization: async (opts: unknown) => {
@@ -109,11 +124,21 @@ function setup(options: Options = {}) {
     ALTER_SIGNIN_KEY: "unused",
     ALLOWED_USERS: options.allowed ?? "user_1",
   } satisfies HostedEnv;
+  // Like Alter: a code works once, for the session it was issued to, and is burned by its first attempt.
+  const burned = new Set<string>();
   const signIn: SignIn = {
-    start: async () => ({ authUrl: "https://idp.example.com/authorize?x=1", sessionToken: "alter-session-secret", expiresIn: 600 }),
-    poll: async (token) => {
-      calls.push({ name: "poll", args: [token] });
-      return options.poll ?? { status: "pending" };
+    start: async (startOptions) => {
+      calls.push({ name: "start", args: [startOptions] });
+      if (options.startFails) throw new SignInStartError("The sign-in could not be started. Try again from your MCP client.");
+      return { authUrl: "https://idp.example.com/authorize?x=1", sessionToken: "alter-session-secret", expiresIn: 600 };
+    },
+    redeem: async (sessionToken, code): Promise<RedeemResult> => {
+      calls.push({ name: "redeem", args: [sessionToken, code] });
+      const first = !burned.has(code);
+      burned.add(code);
+      if (first) await options.duringRedeem?.();
+      if (!first || code !== CODE || sessionToken !== "alter-session-secret") return { status: "failed", message: "The sign-in failed or expired." };
+      return { status: "completed", user: options.user ?? ANA, userToken: "idp-token-ana" };
     },
     close: async () => undefined,
   };
@@ -133,8 +158,28 @@ function setup(options: Options = {}) {
   };
   const run = (request: Request) => handleAuthorize(request, env, UI, { signIn: () => signIn, access: () => access, pollWindowMs: 0 });
   const names = () => calls.map((call) => call.name);
+  const count = (name: string) => names().filter((called) => called === name).length;
   const completed = () => calls.find((call) => call.name === "completeAuthorization")?.args[0] as { userId: string; props: unknown } | undefined;
-  return { run, calls, names, completed, kv };
+  /** A browser: keeps the cookies the Worker sets and sends them back, as a real one does. */
+  const browser = () => {
+    const jar = new Map<string, string>();
+    const send = async (request: Request) => {
+      const headers = new Headers(request.headers);
+      if (jar.size > 0) headers.set("cookie", [...jar].map(([name, value]) => `${name}=${value}`).join("; "));
+      const response = await run(new Request(request, { headers }));
+      for (const line of response.headers.getSetCookie()) {
+        const [pair = ""] = line.split(";");
+        const name = pair.slice(0, pair.indexOf("=")).trim();
+        const value = pair.slice(pair.indexOf("=") + 1).trim();
+        if (/Max-Age=0/i.test(line) || value === "") jar.delete(name);
+        else jar.set(name, value);
+      }
+      return response;
+    };
+    const bindingName = () => [...jar.keys()].find((name) => BINDING_COOKIE.test(name));
+    return { jar, send, bindingName };
+  };
+  return { run, calls, names, count, completed, kv, browser };
 }
 
 const approveForm = (decision: string) =>
@@ -144,7 +189,9 @@ const approveForm = (decision: string) =>
     body: `handle=handle_1&decision=${decision}`,
   });
 const wait = (state = STATE) => new Request(`${ORIGIN}/authorize/wait?state=${encodeURIComponent(state)}`);
-const signedIn = (user = ANA): PollResult => ({ status: "completed", user, userToken: "idp-token-ana" });
+/** The request Alter's redirect makes the browser send: the return address with a code (or an error) and the state. */
+const comeBack = (params: Record<string, string> = { code: CODE }, state = STATE) =>
+  new Request(`${RETURN_URL}?${new URLSearchParams({ ...params, state })}`);
 
 test("the consent page names the client (escaped), where access goes, and that each person uses their own account", async () => {
   const { run } = setup();
@@ -175,8 +222,8 @@ test("deny redirects back to the client without starting a sign-in", async () =>
   assert.equal(calls.length, 0);
 });
 
-test("allow starts an Alter sign-in, keeps its session token encrypted, and shows the sign-in page", async () => {
-  const { run, names, kv } = setup();
+test("allow starts a redirect sign-in that returns to this Worker, binds it to this browser with a cookie, and shows the sign-in page", async () => {
+  const { run, calls, names, kv } = setup();
   const response = await run(approveForm("approve"));
   assert.equal(response.status, 200);
   const body = await response.text();
@@ -185,41 +232,90 @@ test("allow starts an Alter sign-in, keeps its session token encrypted, and show
   assert.match(body, /<div id="connect" hidden>/);
   assert.ok(!body.includes("alter-session-secret"), "the session token never reaches the page");
   assert.match(response.headers.get("content-security-policy") ?? "", /script-src 'nonce-[0-9a-f]{32}'/);
-  assert.match(response.headers.get("set-cookie") ?? "", /upstream=1/);
-  assert.deepEqual(names(), ["approveConsent", "beginUpstream"]);
-  const [key, value] = [...kv.data.entries()][0] ?? [];
-  assert.ok(value && !value.includes("alter-session-secret"), "KV holds only ciphertext");
+  assert.deepEqual(names(), ["approveConsent", "beginUpstream", "start"]);
+  assert.deepEqual(calls.find((call) => call.name === "start")?.args, [{ returnUrl: RETURN_URL, state: STATE }]);
+
+  const cookies = response.headers.getSetCookie();
+  assert.ok(cookies.some((line) => line.startsWith("upstream=1")), "the library's own cookie is still set");
+  const binding = cookies.find((line) => line.startsWith("__Host-alter-signin-")) ?? "";
+  const [, name = "", value = ""] = /^([^=]+)=([^;]+);/.exec(binding) ?? [];
+  assert.match(name, BINDING_COOKIE);
+  assert.match(value, /^[0-9a-f]{64}$/, "256 random bits");
+  assert.match(binding, /; Path=\/; Secure; HttpOnly; SameSite=Lax; Max-Age=900$/);
+  assert.ok(!body.includes(value), "the binding value is not readable by the page");
+
+  const [key, stored] = [...kv.data.entries()][0] ?? [];
+  assert.ok(stored && !stored.includes("alter-session-secret"), "KV holds only ciphertext");
   assert.ok(key && !key.includes(STATE), "KV keys are hashed");
-  assert.deepEqual(await loadPending(kv, STATE), { stage: "signin", sessionToken: "alter-session-secret" });
+  const pending = (await loadPending(kv, STATE)) as { stage: string; sessionToken: string; bindingHash: string };
+  assert.equal(pending.stage, "signin");
+  assert.equal(pending.sessionToken, "alter-session-secret");
+  assert.match(pending.bindingHash, /^[0-9a-f]{64}$/);
+  assert.notEqual(pending.bindingHash, value, "the record holds a hash of the cookie value, not the value");
   assert.equal(await loadPending(kv, "another-state"), null);
 });
 
-test("while the person is still signing in, the poll answers 202", async () => {
-  const { run, kv } = setup({ poll: { status: "pending" } });
-  await savePending(kv, STATE, { stage: "signin", sessionToken: "s" });
-  const response = await run(wait());
-  assert.equal(response.status, 202);
-  assert.deepEqual(await response.json(), { status: "pending" });
+test("if Alter cannot start a bound sign-in, the person sees why and nothing is left pending", async () => {
+  const { run, kv } = setup({ startFails: true });
+  const response = await run(approveForm("approve"));
+  assert.equal(response.status, 502);
+  assert.match(await response.text(), /could not be started/);
+  assert.equal(kv.data.size, 0);
+  assert.ok(!response.headers.getSetCookie().some((line) => line.startsWith("__Host-alter-signin-")));
 });
 
-test("a person who already connected gets a token pinned to their own connection", async () => {
-  const { run, calls, names, completed, kv } = setup({ poll: signedIn(), found: [{ grantId: "grant_ana" }] });
-  await savePending(kv, STATE, { stage: "signin", sessionToken: "s" });
-  const response = await run(wait());
-  assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { redirectTo: "https://claude.ai/api/mcp/auth_callback?code=abc&state=client-state" });
+test("the poll never asks Alter and never completes before the return address has run", async () => {
+  const { browser, names, count } = setup();
+  const page = browser();
+  await page.send(approveForm("approve"));
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await page.send(wait());
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), { status: "pending" });
+  }
+  assert.deepEqual(names(), ["approveConsent", "beginUpstream", "start"], "no redeem, no connection lookup, no token");
+  assert.equal(count("completeAuthorization"), 0);
+});
+
+test("the normal flow: the popup returns with a code, the Worker redeems it for the starting browser, and the poll finishes", async () => {
+  const { browser, calls, names, count, completed, kv } = setup({ found: [{ grantId: "grant_ana" }] });
+  const page = browser();
+  await page.send(approveForm("approve"));
+  assert.ok(page.bindingName(), "the browser holds the binding cookie");
+  assert.equal((await page.send(wait())).status, 202);
+
+  const returned = await page.send(comeBack());
+  assert.equal(returned.status, 200);
+  const body = await returned.text();
+  assert.match(body, /<h1>Signed in<\/h1>/);
+  assert.match(body, /<script nonce="[0-9a-f]{32}">window\.close\(\);<\/script>/);
+  assert.ok(!body.includes("idp-token-ana") && !body.includes(CODE), "the page carries no credential");
+  assert.equal(returned.headers.get("referrer-policy"), "no-referrer");
+  assert.equal(returned.headers.get("cache-control"), "no-store");
+  assert.deepEqual(calls.find((call) => call.name === "redeem")?.args, ["alter-session-secret", CODE]);
+  assert.equal(page.bindingName(), undefined, "the binding cookie is cleared once used");
+  assert.ok(![...kv.data.values()].some((value) => value.includes("idp-token-ana")), "the identity-provider token is stored encrypted");
+  assert.deepEqual(await loadPending(kv, STATE), { stage: "signedin", userToken: "idp-token-ana", user: ANA });
+  assert.ok(!names().includes("find"), "the return address only records who signed in");
+
+  const done = await page.send(wait());
+  assert.equal(done.status, 200);
+  assert.deepEqual(await done.json(), { redirectTo: "https://claude.ai/api/mcp/auth_callback?code=abc&state=client-state" });
   assert.deepEqual(calls.find((call) => call.name === "find")?.args, ["idp-token-ana"], "looked up with the person's own token");
   assert.ok(!names().includes("connect"));
   assert.equal(completed()?.userId, "user_1");
   assert.deepEqual(completed()?.props, { userId: "user_1", email: "ana@example.com", grantId: "grant_ana" });
+  assert.equal(count("redeem"), 1);
   assert.equal(kv.data.size, 0, "the pending sign-in is gone");
 });
 
 test("a first-time person is asked to connect their account, then gets a token for the new connection", async () => {
-  const { run, calls, names, completed, kv } = setup({ poll: signedIn(), found: [null, null, { grantId: "grant_new" }] });
-  await savePending(kv, STATE, { stage: "signin", sessionToken: "s" });
+  const { browser, calls, names, count, completed, kv } = setup({ found: [null, null, { grantId: "grant_new" }] });
+  const page = browser();
+  await page.send(approveForm("approve"));
+  await page.send(comeBack());
 
-  const first = await run(wait());
+  const first = await page.send(wait());
   assert.equal(first.status, 202);
   assert.deepEqual(await first.json(), { status: "connect", connectUrl: "https://connect.example.com/session/1" });
   assert.deepEqual(calls.find((call) => call.name === "connect")?.args, ["idp-token-ana"]);
@@ -228,20 +324,194 @@ test("a first-time person is asked to connect their account, then gets a token f
   assert.ok(!stored.includes("idp-token-ana"), "the identity-provider token is stored encrypted");
   assert.equal((await loadPending(kv, STATE))?.stage, "connect");
 
-  const second = await run(wait());
+  const second = await page.send(wait());
   assert.equal(second.status, 202, "still connecting");
-  assert.equal(names().filter((name) => name === "connect").length, 1, "one Connect session, not one per poll");
+  assert.equal(count("connect"), 1, "one Connect session, not one per poll");
 
-  const third = await run(wait());
+  const third = await page.send(wait());
   assert.equal(third.status, 200);
   assert.deepEqual(completed()?.props, { userId: "user_1", email: "ana@example.com", grantId: "grant_new" });
   assert.equal(kv.data.size, 0);
 });
 
+test("a return request without the binding cookie is refused and the code is never redeemed", async () => {
+  const { browser, names, kv } = setup();
+  const page = browser();
+  await page.send(approveForm("approve"));
+  const before = [...kv.data.values()];
+
+  const response = await browser().send(comeBack());
+  assert.equal(response.status, 403);
+  const body = await response.text();
+  assert.match(body, /not started in this browser/);
+  assert.ok(!body.includes("window.close"));
+  assert.ok(!names().includes("redeem"), "the code is never redeemed");
+  assert.deepEqual([...kv.data.values()], before, "the pending sign-in is untouched");
+
+  // The browser that started it is not locked out by the stray request.
+  assert.equal((await page.send(comeBack())).status, 200);
+  assert.equal((await page.send(wait())).status, 200);
+});
+
+test("a return request with the wrong binding cookie is refused and the code is never redeemed", async () => {
+  const { browser, names, kv } = setup();
+  const page = browser();
+  await page.send(approveForm("approve"));
+  const name = page.bindingName() ?? "";
+  const real = page.jar.get(name) ?? "";
+
+  const guesses = ["0".repeat(64), `${real.slice(0, 63)}${real.endsWith("0") ? "1" : "0"}`, real.slice(0, 32), ""];
+  // The stored hash itself is not the cookie value either.
+  guesses.push(((await loadPending(kv, STATE)) as { bindingHash: string }).bindingHash);
+  for (const guess of guesses) {
+    const visitor = browser();
+    visitor.jar.set(name, guess);
+    assert.equal((await visitor.send(comeBack())).status, 403, `refused: ${guess.slice(0, 8)}`);
+  }
+  // Holding only the library's upstream cookie, or the right value under another sign-in's name, is not enough.
+  const other = browser();
+  other.jar.set("upstream", "1");
+  other.jar.set("__Host-alter-signin-0000000000000000", real);
+  assert.equal((await other.send(comeBack())).status, 403);
+  assert.ok(!names().includes("redeem"));
+  assert.equal((await loadPending(kv, STATE))?.stage, "signin");
+});
+
+test("a replayed return request redeems nothing and does not disturb the sign-in", async () => {
+  const { browser, count, completed, kv } = setup();
+  const page = browser();
+  await page.send(approveForm("approve"));
+  const cookies = new Map(page.jar);
+  assert.equal((await page.send(comeBack())).status, 200);
+
+  // Replayed by the same browser (a reload), by one that kept the old cookie, and by a stranger.
+  const replays = [page, browser(), browser()];
+  for (const [name, value] of cookies) replays[1]?.jar.set(name, value);
+  for (const replay of replays) {
+    const response = await replay.send(comeBack());
+    assert.equal(response.status, 409);
+    assert.match(await response.text(), /already completed/);
+  }
+  assert.equal(count("redeem"), 1, "the code was redeemed once");
+  assert.equal((await loadPending(kv, STATE))?.stage, "signedin");
+
+  assert.equal((await page.send(wait())).status, 200);
+  assert.equal(completed()?.userId, "user_1");
+  // And once the flow is over, the same request finds nothing.
+  assert.equal((await page.send(comeBack())).status, 410);
+  assert.equal(count("redeem"), 1);
+});
+
+test("an error return from the starting browser ends the flow; from any other browser it changes nothing", async () => {
+  const { browser, names, kv } = setup();
+  const page = browser();
+  await page.send(approveForm("approve"));
+
+  const stranger = await browser().send(comeBack({ error: "user_denied" }));
+  assert.equal(stranger.status, 403);
+  assert.equal((await loadPending(kv, STATE))?.stage, "signin", "someone else cannot cancel the sign-in");
+  assert.equal((await page.send(wait())).status, 202);
+
+  const response = await page.send(comeBack({ error: "identity_mismatch<script>" }));
+  assert.equal(response.status, 400);
+  const body = await response.text();
+  assert.match(body, /<h1>Sign-in failed<\/h1>/);
+  assert.ok(!body.includes("identity_mismatch"), "the error parameter is not echoed");
+  assert.equal(page.bindingName(), undefined);
+
+  const polled = await page.send(wait());
+  assert.equal(polled.status, 400);
+  assert.match(JSON.stringify(await polled.json()), /failed or expired/);
+  assert.equal(kv.data.size, 0);
+  assert.ok(!names().includes("redeem") && !names().includes("find") && !names().includes("completeAuthorization"));
+});
+
+test("an error return that also carries a code is still a failure, and a return with neither is too", async () => {
+  for (const params of [{ error: "user_denied", code: CODE }, {}] as Record<string, string>[]) {
+    const { browser, names, kv } = setup();
+    const page = browser();
+    await page.send(approveForm("approve"));
+    assert.equal((await page.send(comeBack(params))).status, 400);
+    assert.ok(!names().includes("redeem"));
+    assert.equal((await loadPending(kv, STATE))?.stage, "failed");
+  }
+});
+
+test("a code Alter refuses ends the flow without a token", async () => {
+  const { browser, count, names, kv } = setup();
+  const page = browser();
+  await page.send(approveForm("approve"));
+  const response = await page.send(comeBack({ code: "not-the-code" }));
+  assert.equal(response.status, 400);
+  assert.equal(count("redeem"), 1);
+  assert.equal((await page.send(wait())).status, 400);
+  assert.ok(!names().includes("completeAuthorization"));
+  assert.equal(kv.data.size, 0);
+});
+
+test("a failed redeem racing a successful one does not undo it", async () => {
+  const state = setup({
+    // Another request from the same browser finishes first; this one's code then fails.
+    duringRedeem: async () => savePending(state.kv, STATE, { stage: "signedin", userToken: "idp-token-ana", user: ANA }),
+  });
+  const page = state.browser();
+  await page.send(approveForm("approve"));
+  assert.equal((await page.send(comeBack({ code: "not-the-code" }))).status, 400);
+  assert.equal((await loadPending(state.kv, STATE))?.stage, "signedin");
+});
+
+test("a state that matches no pending sign-in is refused at the return address and at the poll", async () => {
+  const { browser, names } = setup();
+  const page = browser();
+  await page.send(approveForm("approve"));
+  for (const request of [comeBack({ code: CODE }, "nothing-stored"), new Request(`${RETURN_URL}?code=${CODE}`), new Request(RETURN_URL)]) {
+    const response = await page.send(request);
+    assert.equal(response.status, 410);
+    assert.match(await response.text(), /expired/);
+  }
+  assert.ok(!names().includes("redeem"));
+  assert.equal((await setup().run(wait("nothing-stored"))).status, 410);
+  assert.equal((await setup().run(new Request(RETURN_URL, { method: "POST" }))).status, 404, "the return address answers GET only");
+});
+
+test("the attack: a sign-in link sent to someone else gives the sender nothing", async () => {
+  const { browser, names, count, kv } = setup();
+  // Mallory starts /authorize in her own browser and gets the sign-in page with the identity provider link.
+  const mallory = browser();
+  const started = await mallory.send(approveForm("approve"));
+  assert.match(await started.text(), /https:\/\/idp\.example\.com\/authorize\?x=1/);
+  assert.equal((await mallory.send(wait())).status, 202);
+
+  // She sends Ana the link. Ana signs in, and Alter redirects ANA'S browser to the return address
+  // with the one-time code. Ana's browser never held Mallory's binding cookie.
+  const ana = browser();
+  const landed = await ana.send(comeBack());
+  assert.equal(landed.status, 403);
+  assert.match(await landed.text(), /not started in this browser.*nobody was given access/);
+  assert.equal(count("redeem"), 0, "Ana's code is never redeemed");
+
+  // Mallory's page keeps polling. Before this fix the poll asked Alter and received Ana's token here.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const polled = await mallory.send(wait());
+    assert.equal(polled.status, 202);
+    assert.deepEqual(await polled.json(), { status: "pending" });
+  }
+  // Mallory holds the cookie but never saw the code, which went only to Ana's browser.
+  assert.equal((await mallory.send(comeBack({ code: "a-guess" }))).status, 400);
+  assert.equal((await mallory.send(wait())).status, 400);
+
+  assert.ok(!names().includes("find") && !names().includes("connect"), "no connection was looked up for anyone");
+  assert.equal(count("completeAuthorization"), 0, "no token was issued");
+  assert.equal(kv.data.size, 0);
+});
+
 test("if the identity-provider token expires while connecting, the flow ends cleanly", async () => {
-  const { run, names, kv } = setup({ found: ["throw"] });
-  await savePending(kv, STATE, { stage: "connect", userToken: "t", user: ANA, connectUrl: "https://c" });
-  const response = await run(wait());
+  const { browser, names, kv } = setup({ found: [null, "throw"] });
+  const page = browser();
+  await page.send(approveForm("approve"));
+  await page.send(comeBack());
+  assert.equal((await page.send(wait())).status, 202);
+  const response = await page.send(wait());
   assert.equal(response.status, 400);
   assert.match(JSON.stringify(await response.json()), /expired before the connection finished/);
   assert.ok(names().includes("finishUpstream"), "the state is consumed");
@@ -249,9 +519,11 @@ test("if the identity-provider token expires while connecting, the flow ends cle
 });
 
 test("someone not on the allowed list is refused before any connection is looked up", async () => {
-  const { run, names, kv } = setup({ poll: signedIn({ sub: "user_2", email: "x@other.com" }) });
-  await savePending(kv, STATE, { stage: "signin", sessionToken: "s" });
-  const response = await run(wait());
+  const { browser, names, kv } = setup({ user: { sub: "user_2", email: "x@other.com" } });
+  const page = browser();
+  await page.send(approveForm("approve"));
+  assert.equal((await page.send(comeBack())).status, 200, "the return address only records who signed in");
+  const response = await page.send(wait());
   assert.equal(response.status, 403);
   assert.ok(!names().includes("find") && !names().includes("completeAuthorization"));
   assert.ok(names().includes("finishUpstream"), "the state is consumed");
@@ -270,21 +542,15 @@ test("allowed users: ids, emails, a whole @domain, or *; an empty list refuses e
   assert.deepEqual([...parseAllowedUsers(" user_1, ,A@B.com ")], ["user_1", "a@b.com"]);
 });
 
-test("a poll from another browser is refused by the state binding", async () => {
-  const { run, names, kv } = setup({ poll: signedIn(), finishFails: true });
-  await savePending(kv, STATE, { stage: "signin", sessionToken: "s" });
-  const response = await run(wait());
+test("a poll from another browser, after the sign-in is stored, is refused by the state binding", async () => {
+  const { browser, names } = setup();
+  const page = browser();
+  await page.send(approveForm("approve"));
+  await page.send(comeBack());
+  const response = await browser().send(wait());
   assert.equal(response.status, 400);
+  assert.match(JSON.stringify(await response.json()), /not started in this browser/);
   assert.ok(!names().includes("completeAuthorization"));
-});
-
-test("a failed or expired sign-in, or an unknown state, ends the flow", async () => {
-  const failed = setup({ poll: { status: "failed", message: "The sign-in failed or expired." } });
-  await savePending(failed.kv, STATE, { stage: "signin", sessionToken: "s" });
-  const response = await failed.run(wait());
-  assert.equal(response.status, 400);
-  assert.match(JSON.stringify(await response.json()), /failed or expired/);
-  assert.equal((await setup().run(wait("nothing-stored"))).status, 410);
 });
 
 function server() {
