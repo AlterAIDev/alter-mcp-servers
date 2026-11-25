@@ -1,4 +1,4 @@
-# Alter MCP servers
+# Multi-User MCP servers
 
 Open-source MCP servers for AI agents where **the server never holds the provider token** and risky actions **wait for a person's approval**. Each server holds only an [Alter](https://alterauth.com) agent key. Alter stores the provider credential, adds it to each request, enforces the policies set on the agent, holds what needs approval, and records every call.
 
